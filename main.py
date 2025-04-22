@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 import sys
 import asyncpg
 import aiohttp
+import traceback
 import socket
 import os
 import sqlite3
@@ -64,15 +65,9 @@ I'll answer as the world-famous <specific field> scientists with <most prestigio
 <Deep knowledge step-by-step answer, with CONCRETE details>
 
 # Telegram Formatting Instructions (HTML):
-# - Your response MUST be formatted exclusively using these Telegram-supported HTML tags: <b>bold</b>, <i>italic</i>, <u>underline</u>, <s>strikethrough</s>, <tg-spoiler>spoiler</tg-spoiler>, <code>inline code</code>, <a href='URL'>link</a>. (NOTE: <pre> is NOT allowed).
+# - Your response MUST be formatted exclusively using these Telegram-supported HTML tags: <b>bold</b>, <i>italic</i>, <u>underline</u>, <s>strikethrough</s>, <tg-spoiler>spoiler</tg-spoiler>, <code>inline code</code>, <pre>code block</pre>, <a href='URL'>link</a>.
 # - It is absolutely forbidden to use any Markdown syntax. This includes, but is not limited to: **bold**, *italic*, _italic_, `inline code`, ```code blocks```, # Headers (any level, like ## or ####), > blockquotes, - or * list items.
 # - The final output must be directly usable in Telegram with parse_mode=HTML without any further processing. Ensure NO Markdown formatting remains.
-#
-# - Structure your response clearly with appropriate paragraph breaks (double newlines between distinct blocks).
-# - Use vertical whitespace (empty lines) effectively to separate sections, lists, or code blocks for better readability.
-# - Present information in a clean, well-organized, and visually appealing manner suitable for a chat interface.
-# - CRITICALLY IMPORTANT: NEVER generate tables in any format (Markdown `|---|`, HTML `<table>`, visually aligned text). Instead, present data that would normally be in a table as a descriptive list or text paragraphs.
-# - Reiterate: Present ALL data as natural language descriptions or simple bullet point lists ONLY. Avoid any table-like or pre-formatted text block formatting.
 """
 CONVERSATION_HISTORY_LIMIT = 10
 MESSAGE_EXPIRATION_DAYS = 7
@@ -80,66 +75,92 @@ MESSAGE_EXPIRATION_DAYS = 7
 # Максимальная длина сообщения Telegram (чуть меньше лимита 4096)
 TELEGRAM_MAX_LENGTH = 4000
 
-# Обновленный паттерн для разрешенных HTML тегов Telegram (БЕЗ PRE)
-ALLOWED_TAGS_PATTERN_TEXT = r"</?(?:b|i|u|s|tg-spoiler|code|a(?:\s+href\s*=\s*(?:\"[^\"]*\"|'[^\']*'))?)\s*>/?"
+# Обновленный паттерн для разрешенных HTML тегов Telegram
+ALLOWED_TAGS_PATTERN_TEXT = r"</?(?:b|i|u|s|tg-spoiler|code|pre|a(?:\s+href\s*=\s*(?:\"[^\"]*\"|'[^\']*'))?)\s*>/?"
 ALLOWED_TAGS_PATTERN = re.compile(ALLOWED_TAGS_PATTERN_TEXT, re.IGNORECASE)
 
 async def clean_html_for_telegram(text: str) -> str:
     """
-    УДАЛЯЕТ таблицы и pre. Экранирует ВСЕ, затем вручную РАЗЭКРАНИРУЕТ
-    только РАЗРЕШЕННЫЕ Telegram HTML теги (b, i, u, s, code, tg-spoiler, a).
-    НЕ ВЫПОЛНЯЕТ конвертацию Markdown.
+    Преобразует Markdown в HTML, обрабатывает таблицы и очищает HTML
+    для безопасной отправки в Telegram с parse_mode=HTML.
     """
     if not text:
         return ""
-    # 1. Failsafe: Принудительно удалить полные блоки таблиц и теги pre из исходного текста
+
+    # 1. Конвертация Markdown в HTML (порядок важен)
     try:
-        text = re.sub(r"<table[^>]*>.*?</table>", "", text, flags=re.IGNORECASE | re.DOTALL)
-        text = re.sub(r"<pre[^>]*>", "", text, flags=re.IGNORECASE)
-        text = re.sub(r"</pre\s*>", "", text, flags=re.IGNORECASE)
-    except Exception as e:
-        logging.error(f"Ошибка на этапе начального удаления тегов: {e}")
+        # Блоки кода (самые приоритетные из-за символов внутри)
+        text = re.sub(r"^\s*```([^\n]*)\n(.*?)\n```", r"<pre>\2</pre>", text, flags=re.DOTALL | re.MULTILINE)
+        text = re.sub(r"^\s*```()\n(.*?)\n```", r"<pre>\2</pre>", text, flags=re.DOTALL | re.MULTILINE) # Без языка
 
-    # 2. Экранировать ВСЕ HTML-символы
-    try:
-        escaped_text = html.escape(text)
-    except Exception as e:
-        logging.error(f"Ошибка на этапе html.escape: {e}")
-        escaped_text = text # Fallback
+        # Встроенный код
+        text = re.sub(r"`([^`\n]+)`", r"<code>\1</code>", text)
 
-    # 3. Вручную "разэкранировать" разрешенные теги
-    final_text = escaped_text
-    try:
-        # Сначала обрабатываем ссылки <a>, т.к. они сложнее
-        # Ищем экранированную ссылку: &lt;a href="..."&gt;...&lt;/a&gt;
-        link_pattern = re.compile(r"&lt;a\s+href\s*=\s*(&quot;)(.*?)\1&gt;(.*?)&lt;/a&gt;", re.IGNORECASE)
+        # Заголовки (просто жирный текст)
+        text = re.sub(r"^\s*#{1,6}\s+(.+)", r"<b>\1</b>", text, flags=re.MULTILINE)
 
-        def unescape_link(match):
-            href_content = match.group(2)
-            link_text = match.group(3) # link_text остается экранированным!
-            unescaped_href = html.unescape(href_content) # Разэкранируем только href (для &amp;)
-            return f'<a href="{unescaped_href}">{link_text}</a>'
+        # Жирный и подчеркнутый
+        text = re.sub(r"\*\*(.*?)\*\*", r"<b>\1</b>", text)
+        text = re.sub(r"__(.*?)__", r"<u>\1</u>", text) # Используем <u> для подчеркивания
 
-        final_text = link_pattern.sub(unescape_link, final_text)
+        # Курсив
+        text = re.sub(r"\*(.*?)\*", r"<i>\1</i>", text)
+        text = re.sub(r"_(.*?)_", r"<i>\1</i>", text) # Используем <i> для курсива
 
-        # Затем простые теги с помощью карты замен
-        allowed_tags_map = {
-            '&lt;b&gt;': '<b>', '&lt;/b&gt;': '</b>',
-            '&lt;i&gt;': '<i>', '&lt;/i&gt;': '</i>',
-            '&lt;u&gt;': '<u>', '&lt;/u&gt;': '</u>',
-            '&lt;s&gt;': '<s>', '&lt;/s&gt;': '</s>',
-            '&lt;code&gt;': '<code>', '&lt;/code&gt;': '</code>',
-            '&lt;tg-spoiler&gt;': '<tg-spoiler>', '&lt;/tg-spoiler&gt;': '</tg-spoiler>',
-        }
-        for escaped, original in allowed_tags_map.items():
-            final_text = final_text.replace(escaped, original)
+        # Зачеркнутый
+        text = re.sub(r"~~(.*?)~~", r"<s>\1</s>", text)
+
+        # Списки (простая замена на маркер)
+        text = re.sub(r"^\s*[-*+]\s+", "• ", text, flags=re.MULTILINE)
+
+        # --- Обработка таблиц ---
+        # Найти блоки, похожие на таблицы Markdown
+        table_pattern = re.compile(r"(?:^\|.*\|$\n?)+", re.MULTILINE)
+
+        def format_table(match):
+            table_content = match.group(0).strip()
+            # Экранируем HTML внутри таблицы и оборачиваем в <pre>
+            escaped_table_content = html.escape(table_content)
+            return f"<pre>{escaped_table_content}</pre>\n"
+
+        text = table_pattern.sub(format_table, text)
+        # --- Конец обработки таблиц ---
 
     except Exception as e:
-        logging.error(f"Ошибка на этапе разэкранирования тегов: {e}")
-        # В случае ошибки возвращаем просто экранированный текст (самый безопасный вариант)
-        final_text = escaped_text
+        logging.error(f"Ошибка на этапе конвертации Markdown: {e}")
+        # В случае ошибки продолжаем с оригинальным текстом, очистка HTML сработает позже
 
-    return final_text
+    # 2. Финальная очистка HTML
+    try:
+        # Сначала экранируем ВСЁ
+        escaped_text = html.escape(text, quote=False)
+
+        # Функция для разэкранирования только валидных тегов
+        def unescape_valid_tag(match):
+            tag = match.group(0)
+            unescaped_tag = html.unescape(tag)
+            # Используем pre-compiled паттерн
+            if ALLOWED_TAGS_PATTERN.fullmatch(unescaped_tag):
+                return unescaped_tag
+            else:
+                # Если невалидный (например, стал &lt;table&gt;), оставляем экранированным
+                return tag
+
+        # Паттерн для поиска экранированных ВАЛИДНЫХ тегов Telegram
+        # Этот паттерн ищет &lt;b&gt;, &lt;a href...&gt; и т.д.
+        potential_escaped_tag_pattern = re.compile(
+             r"&lt;/?(?:b|i|u|s|tg-spoiler|code|pre|a(?:\s+href\s*=\s*(?:\"[^\"]*\"|'[^\']*'))?)\s*&gt;/?",
+             re.IGNORECASE
+        )
+
+        cleaned_text = potential_escaped_tag_pattern.sub(unescape_valid_tag, escaped_text)
+
+    except Exception as e:
+        logging.error(f"Ошибка на этапе финальной очистки HTML: {e}")
+        # Безопасный fallback - полностью экранированный текст
+        cleaned_text = html.escape(text, quote=False)
+
+    return cleaned_text
 
 # Класс настроек
 class Settings(BaseSettings):
@@ -290,16 +311,35 @@ async def get_last_messages_sqlite(db_path: str, user_id: int, limit: int = 10) 
 async def add_message_to_postgres(pool: asyncpg.Pool, user_id: int, role: str, content: str):
     try:
         async with pool.acquire() as connection:
+            # Добавляем новое сообщение
             await connection.execute(
                 "INSERT INTO conversations (user_id, role, content) VALUES ($1, $2, $3)",
                 user_id, role, content
             )
-            logging.debug(f"PostgreSQL: Сообщение {role} для пользователя {user_id} сохранено в БД")
+
+            # Добавляем логику очистки: удаляем старые сообщения, оставляя только последние 10
+            # Убедитесь, что в таблице 'conversations' есть PK 'id' и поле 'timestamp'
+            cleanup_query = """
+            WITH numbered_messages AS (
+                SELECT
+                    id,
+                    ROW_NUMBER() OVER(PARTITION BY user_id ORDER BY timestamp DESC) as rn
+                FROM conversations
+                WHERE user_id = $1
+            )
+            DELETE FROM conversations
+            WHERE id IN (SELECT id FROM numbered_messages WHERE rn > 10);
+            """
+            await connection.execute(cleanup_query, user_id)
+            # Обновляем лог, чтобы отразить очистку
+            logging.debug(f"PostgreSQL: Сообщение {role} для пользователя {user_id} сохранено и выполнена очистка истории (оставлено <= 10).")
     except asyncpg.PostgresError as e:
-        logging.error(f"PostgreSQL: Ошибка при добавлении сообщения: {e}")
+        # Обновляем лог ошибки
+        logging.error(f"PostgreSQL: Ошибка при добавлении сообщения или очистке истории: {e}")
         raise
     except Exception as e:
-        logging.exception(f"PostgreSQL: Непредвиденная ошибка: {e}")
+        # Обновляем лог ошибки
+        logging.exception(f"PostgreSQL: Непредвиденная ошибка при добавлении сообщения или очистке истории: {e}")
         raise
 
 async def get_last_messages_postgres(pool: asyncpg.Pool, user_id: int, limit: int = 10) -> list[dict]:
@@ -456,66 +496,43 @@ async def message_handler(message: types.Message):
             if len(cleaned_response_text) > TELEGRAM_MAX_LENGTH:
                 logging.info(f"Очищенный ответ слишком длинный ({len(cleaned_response_text)} символов), разделяю на части.")
                 parts = []
-                current_part_lines = []
-                current_part_len = 0
-
-                lines = cleaned_response_text.split('\n')
-
-                for line in lines:
-                    line_len = len(line)
-                    # +1 для символа новой строки, который будет добавлен при join
-                    potential_new_len = current_part_len + line_len + (1 if current_part_lines else 0)
-
-                    # Если добавление этой строки превысит лимит (и часть не пуста)
-                    if current_part_lines and potential_new_len > TELEGRAM_MAX_LENGTH:
-                        # Завершаем текущую часть
-                        parts.append("\n".join(current_part_lines))
-                        # Начинаем новую часть с текущей строки
-                        current_part_lines = [line]
-                        current_part_len = line_len
-                    # Если сама строка слишком длинная (даже для одной части)
-                    elif line_len > TELEGRAM_MAX_LENGTH:
-                        # Сначала добавляем накопленную часть, если она есть
-                        if current_part_lines:
-                            parts.append("\n".join(current_part_lines))
-
-                        # Делим длинную строку на максимально возможные куски
-                        for i in range(0, line_len, TELEGRAM_MAX_LENGTH):
-                            parts.append(line[i:i + TELEGRAM_MAX_LENGTH])
-
-                        # Сбрасываем текущую часть, т.к. длинная строка обработана
-                        current_part_lines = []
-                        current_part_len = 0
+                current_part = ""
+                # Делим ОЧИЩЕННЫЙ текст
+                for paragraph in cleaned_response_text.split('\n\n'):
+                    # Если добавление параграфа не превышает лимит
+                    if len(current_part) + len(paragraph) + 2 <= TELEGRAM_MAX_LENGTH:
+                        current_part += paragraph + "\n\n"
                     else:
-                        # Добавляем строку к текущей части
-                        current_part_lines.append(line)
-                        # Обновляем длину текущей части (учитывая будущий join(\n))
-                        current_part_len = len("\n".join(current_part_lines))
+                        # Если сам параграф слишком длинный, делим его грубо
+                        if len(paragraph) > TELEGRAM_MAX_LENGTH:
+                            if current_part.strip(): # Добавляем накопленное
+                                parts.append(current_part.strip())
+                            current_part = "" # Сбрасываем текущую часть
+                            # Делим длинный параграф
+                            for i in range(0, len(paragraph), TELEGRAM_MAX_LENGTH):
+                                parts.append(paragraph[i:i + TELEGRAM_MAX_LENGTH])
+                        else:
+                            # Добавляем накопленную часть и начинаем новую
+                            if current_part.strip():
+                                parts.append(current_part.strip())
+                            current_part = paragraph + "\n\n"
 
-                # Добавляем последнюю накопленную часть, если она есть
-                if current_part_lines:
-                    parts.append("\n".join(current_part_lines))
+                if current_part.strip(): # Добавляем последнюю часть
+                    parts.append(current_part.strip())
 
-                # Фильтруем пустые части на всякий случай (хотя их быть не должно)
-                parts = [part for part in parts if part]
-
-                # Отправляем части
                 for i, part in enumerate(parts):
                     logging.info(f"Отправка очищенной части {i+1}/{len(parts)} пользователю {user_id}")
-                    # ЛОГИРОВАНИЕ ПЕРЕД ОТПРАВКОЙ ЧАСТИ
-                    logging.debug(f"--- Текст части {i+1} для отправки ---\n{part}\n-----------------------------------")
                     try:
+                        # Отправляем очищенную часть
                         await message.answer(part, parse_mode='HTML')
                         await asyncio.sleep(0.5) # Небольшая задержка
                     except Exception as send_error:
                         logging.error(f"Ошибка отправки части {i+1}: {send_error}")
-                        # Упрощенное сообщение об ошибке без HTML
-                        await message.answer(f"Произошла ошибка при отправке части {i+1} ответа.")
-                        break # Прерываем отправку остальных частей
+                        await message.answer(f"Ошибка при отправке части {i+1} ответа.")
+                        # Возможно, стоит прервать отправку остальных частей
+                        break
             else:
                 # Отправляем очищенный ответ пользователю целиком
-                # ЛОГИРОВАНИЕ ПЕРЕД ОТПРАВКОЙ ЦЕЛОГО СООБЩЕНИЯ
-                logging.debug(f"--- Текст целого сообщения для отправки ---\n{cleaned_response_text}\n-----------------------------------")
                 await message.answer(cleaned_response_text, parse_mode='HTML')
 
         else:
@@ -528,11 +545,26 @@ async def message_handler(message: types.Message):
         await message.answer("Произошла ошибка при обработке сообщения")
 
 # Обработчик завершения работы
-async def on_shutdown(dp: Dispatcher):
-    db = dp.workflow_data.get('db')
-    if db and not settings.USE_SQLITE:
-        await db.close()
-        logging.info("Соединение с базой данных закрыто")
+# Исправляем сигнатуру, чтобы она принимала **kwargs, как передает aiogram
+async def on_shutdown(**kwargs):
+    # Получаем db и settings из workflow_data, переданных как kwargs
+    db = kwargs.get('db')
+    settings = kwargs.get('settings')
+
+    if db and settings:
+        if not settings.USE_SQLITE:
+            try:
+                # db здесь это пул соединений asyncpg
+                await db.close()
+                logging.info("Пул соединений PostgreSQL успешно закрыт")
+            except Exception as e:
+                logging.error(f"Ошибка при закрытии пула соединений PostgreSQL: {e}")
+        else:
+            # Для SQLite пул соединений не используется в том же виде,
+            # закрывать нечего (соединения открываются/закрываются в _add_message/_get_messages)
+            logging.info("Используется SQLite, закрытие пула соединений не требуется.")
+    else:
+        logging.warning("Не удалось получить 'db' или 'settings' из workflow_data при завершении работы.")
 
 # Основная функция
 async def main():
