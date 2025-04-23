@@ -17,6 +17,10 @@ import html
 import re
 import base64
 import io
+import typing
+import time
+from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
+from aiogram.utils.text_decorations import html_decoration
 
 # Настройка логирования
 logging.basicConfig(
@@ -85,21 +89,45 @@ async def clean_html_for_telegram(text: str) -> str:
     """
     Преобразует Markdown в HTML, обрабатывает таблицы и очищает HTML
     для безопасной отправки в Telegram с parse_mode=HTML.
+    Также добавляет отступы для иерархической структуры текста.
     """
     if not text:
         return ""
 
+    # Удаляем существующие HTML-теги перед форматированием для избежания конфликтов
+    text = strip_html_tags(text)
+        
     # 1. Конвертация Markdown в HTML (порядок важен)
     try:
+        # Определение уровней заголовков для отступов
+        heading_level = {}
+        current_level = 0
+        indent_char = "    "  # 4 пробела для отступа
+        
+        # Функция для добавления отступов
+        def add_indent(match):
+            nonlocal current_level
+            header_text = match.group(2)
+            # Используем количество # для определения уровня
+            level = len(match.group(1))
+            if level > 0:
+                # Запоминаем уровень заголовка
+                heading_level[header_text] = level
+                # Заголовок первого уровня - без отступа
+                current_level = level - 1
+                indentation = indent_char * current_level if current_level > 0 else ""
+                return f"{indentation}<b>{header_text}</b>"
+            return f"<b>{header_text}</b>"
+            
+        # Заголовки с отступами
+        text = re.sub(r'^(#{1,6})\s+(.+)$', add_indent, text, flags=re.MULTILINE)
+        
         # Блоки кода (самые приоритетные из-за символов внутри)
         text = re.sub(r"^\s*```([^\n]*)\n(.*?)\n```", r"<pre>\2</pre>", text, flags=re.DOTALL | re.MULTILINE)
         text = re.sub(r"^\s*```()\n(.*?)\n```", r"<pre>\2</pre>", text, flags=re.DOTALL | re.MULTILINE) # Без языка
 
-        # Встроенный код
+        # Встроенный код (моноширный)
         text = re.sub(r"`([^`\n]+)`", r"<code>\1</code>", text)
-
-        # Заголовки (просто жирный текст)
-        text = re.sub(r"^\s*#{1,6}\s+(.+)", r"<b>\1</b>", text, flags=re.MULTILINE)
 
         # Жирный и подчеркнутый
         text = re.sub(r"\*\*(.*?)\*\*", r"<b>\1</b>", text)
@@ -112,8 +140,19 @@ async def clean_html_for_telegram(text: str) -> str:
         # Зачеркнутый
         text = re.sub(r"~~(.*?)~~", r"<s>\1</s>", text)
 
-        # Списки (простая замена на маркер)
-        text = re.sub(r"^\s*[-*+]\s+", "• ", text, flags=re.MULTILINE)
+        # Списки с отступами
+        indent_level = 0
+        
+        def indent_list_item(match):
+            nonlocal indent_level
+            item_text = match.group(0)
+            leading_spaces = len(item_text) - len(item_text.lstrip())
+            # Определение уровня вложенности на основе отступа
+            indent_level = leading_spaces // 2  # примерно 2 пробела = 1 уровень
+            indentation = indent_char * indent_level
+            return f"{indentation}• {match.group(1)}"
+            
+        text = re.sub(r"^\s*[-*+]\s+(.*?)$", indent_list_item, text, flags=re.MULTILINE)
 
         # --- Обработка таблиц ---
         # Найти блоки, похожие на таблицы Markdown
@@ -130,39 +169,29 @@ async def clean_html_for_telegram(text: str) -> str:
 
     except Exception as e:
         logging.error(f"Ошибка на этапе конвертации Markdown: {e}")
-        # В случае ошибки продолжаем с оригинальным текстом, очистка HTML сработает позже
+        # В случае ошибки возвращаем текст без форматирования
+        return text
 
-    # 2. Финальная очистка HTML
-    try:
-        # Сначала экранируем ВСЁ
-        escaped_text = html.escape(text, quote=False)
+    # Финальная проверка для защиты от ошибок форматирования
+    if not is_valid_html(text):
+        logging.warning("HTML невалиден после форматирования, возвращаем исходный текст")
+        return text
+        
+    return text
 
-        # Функция для разэкранирования только валидных тегов
-        def unescape_valid_tag(match):
-            tag = match.group(0)
-            unescaped_tag = html.unescape(tag)
-            # Используем pre-compiled паттерн
-            if ALLOWED_TAGS_PATTERN.fullmatch(unescaped_tag):
-                return unescaped_tag
-            else:
-                # Если невалидный (например, стал &lt;table&gt;), оставляем экранированным
-                return tag
-
-        # Паттерн для поиска экранированных ВАЛИДНЫХ тегов Telegram
-        # Этот паттерн ищет &lt;b&gt;, &lt;a href...&gt; и т.д.
-        potential_escaped_tag_pattern = re.compile(
-             r"&lt;/?(?:b|i|u|s|tg-spoiler|code|pre|a(?:\s+href\s*=\s*(?:\"[^\"]*\"|'[^\']*'))?)\s*&gt;/?",
-             re.IGNORECASE
-        )
-
-        cleaned_text = potential_escaped_tag_pattern.sub(unescape_valid_tag, escaped_text)
-
-    except Exception as e:
-        logging.error(f"Ошибка на этапе финальной очистки HTML: {e}")
-        # Безопасный fallback - полностью экранированный текст
-        cleaned_text = html.escape(text, quote=False)
-
-    return cleaned_text
+def has_partial_html_tags(text: str) -> bool:
+    """Проверяет, есть ли незакрытые или частичные HTML-теги в тексте."""
+    # Считаем открывающие и закрывающие скобки
+    if text.count('<') != text.count('>'):
+        return True
+    
+    # Проверим самые популярные теги
+    tags = ['b', 'i', 'u', 's', 'code', 'pre', 'a', 'tg-spoiler']
+    for tag in tags:
+        if text.count(f'<{tag}') != text.count(f'</{tag}>'):
+            return True
+    
+    return False
 
 # Класс настроек
 class Settings(BaseSettings):
@@ -436,6 +465,82 @@ async def get_deepseek_response(api_key: str, system_prompt: str, history: list[
             logging.exception(f"Неожиданная ошибка при запросе к DeepSeek: {e}")
             return f"Произошла непредвиденная ошибка: {e}"
 
+# --- Новая функция stream_deepseek_response ---
+async def stream_deepseek_response(api_key: str, system_prompt: str, history: list[dict]) -> typing.AsyncGenerator[str, None]:
+    """
+    Асинхронный генератор для получения ответа от DeepSeek Chat API в режиме стриминга.
+    """
+    messages = [{"role": "system", "content": system_prompt}] + history
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
+    url = "https://api.deepseek.com/v1/chat/completions"
+    payload = {
+        "model": "deepseek-chat",
+        "messages": messages,
+        "stream": True,
+        "max_tokens": 4000
+    }
+
+    try:
+        # Используем общий таймаут None для стриминга
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None)) as session:
+            async with session.post(url, headers=headers, json=payload) as response:
+                response.raise_for_status()  # Проверка на HTTP ошибки (4xx, 5xx)
+
+                async for line in response.content:
+                    line_str = line.decode('utf-8').strip()
+
+                    if not line_str:
+                        continue # Пропускаем пустые строки
+
+                    if line_str.startswith("data: "):
+                        payload_str = line_str[len("data: "):]
+                    else:
+                        # Иногда строки могут приходить без префикса, особенно в начале/конце
+                        payload_str = line_str
+
+                    if payload_str == "[DONE]":
+                        break
+
+                    try:
+                        chunk = json.loads(payload_str)
+                        # Проверка пути к контенту (может отличаться в зависимости от API)
+                        choices = chunk.get('choices')
+                        if choices and isinstance(choices, list) and len(choices) > 0:
+                            delta = choices[0].get('delta')
+                            if delta and isinstance(delta, dict):
+                                delta_content = delta.get('content')
+                                if delta_content and isinstance(delta_content, str):
+                                     # logger.debug(f"Получен чанк: {delta_content!r}") # Раскомментировать для отладки
+                                     yield delta_content
+                                elif 'finish_reason' in choices[0] and choices[0]['finish_reason'] is not None:
+                                    # Иногда finish_reason приходит в последнем чанке без content
+                                    logger.info(f"Стриминг завершен с причиной: {choices[0]['finish_reason']}")
+                                    break
+                                # else: # Пропускаем чанки без content
+                                #    logger.debug(f"Пропущен чанк без content: {chunk}")
+
+                    except json.JSONDecodeError:
+                        logger.error(f"Ошибка декодирования JSON из строки: {payload_str!r}")
+                        continue # Продолжаем читать поток, если одна строка битая
+                    except Exception as e:
+                        logger.error(f"Неожиданная ошибка при обработке чанка JSON: {e}. Чанк: {chunk}")
+                        continue # Продолжаем обработку потока
+
+    except aiohttp.ClientResponseError as e:
+        logger.error(f"Ошибка HTTP запроса к DeepSeek API: {e.status} {e.message}. URL: {url}")
+        # Генератор просто завершится
+    except aiohttp.ClientError as e:
+        logger.error(f"Ошибка сети при запросе к DeepSeek API: {e}. URL: {url}")
+        # Генератор просто завершится
+    except Exception as e:
+        logger.exception(f"Непредвиденная ошибка в stream_deepseek_response: {e}")
+        # Генератор просто завершится
+
+# --- Конец новой функции ---
+
 # Обработчик команды /start
 @dp.message(Command("start"))
 async def start_handler(message: types.Message):
@@ -449,6 +554,7 @@ async def start_handler(message: types.Message):
 @dp.message(F.text)
 async def message_handler(message: types.Message):
     user_id = message.from_user.id
+    chat_id = message.chat.id
     text = message.text
     
     # Получаем зависимости из диспетчера
@@ -477,64 +583,171 @@ async def message_handler(message: types.Message):
         history = await get_last_messages(db, user_id, limit=CONVERSATION_HISTORY_LIMIT)
         logging.info(f"Получена история сообщений для пользователя {user_id}, записей: {len(history)}")
         
-        # Получаем ответ от DeepSeek API
-        response_text = await get_deepseek_response(settings.DEEPSEEK_API_KEY, SYSTEM_PROMPT, history)
+        # Инициализация переменных для стриминга
+        full_response_for_db = ""  # Для сохранения всего ответа в БД
+        current_message_text = ""  # Текст для текущего редактируемого сообщения
+        current_message_id = None  # ID текущего редактируемого сообщения
+        last_edit_time = time.monotonic()  # Время последнего редактирования
+        edit_interval = 1.0  # Интервал троттлинга (секунды)
+        placeholder_sent = False  # Флаг, отправлен ли плейсхолдер
         
-        if response_text:
-            # Очищаем ответ перед сохранением и отправкой
-            cleaned_response_text = await clean_html_for_telegram(response_text)
+        # Стрим ответа от DeepSeek API
+        async for chunk in stream_deepseek_response(settings.DEEPSEEK_API_KEY, SYSTEM_PROMPT, history):
+            # Отправка плейсхолдера (если еще не было)
+            if not placeholder_sent:
+                try:
+                    # Начинаем с пустого плейсхолдера
+                    placeholder_message = await message.answer("⏳")
+                    current_message_id = placeholder_message.message_id
+                    placeholder_sent = True
+                    last_edit_time = time.monotonic()  # Сброс таймера после отправки
+                except TelegramAPIError as e:
+                    logging.error(f"Ошибка отправки плейсхолдера: {e}")
+                    return  # Не можем начать, если плейсхолдер не отправить
             
-            # Сохраняем ОРИГИНАЛЬНЫЙ ответ ассистента
-            await add_message_to_db(db, user_id, "assistant", response_text)
-            logging.info(f"Ответ ассистента для пользователя {user_id} сохранен (оригинал)")
-
-            # Работаем дальше с ОЧИЩЕННЫМ текстом
-            if len(cleaned_response_text) > TELEGRAM_MAX_LENGTH:
-                logging.info(f"Очищенный ответ слишком длинный ({len(cleaned_response_text)} символов), разделяю на части.")
-                parts = []
-                current_part = ""
-                # Делим ОЧИЩЕННЫЙ текст
-                for paragraph in cleaned_response_text.split('\n\n'):
-                    # Если добавление параграфа не превышает лимит
-                    if len(current_part) + len(paragraph) + 2 <= TELEGRAM_MAX_LENGTH:
-                        current_part += paragraph + "\n\n"
+            # Если current_message_id не установлен, прекратить обработку
+            if not current_message_id:
+                break
+                
+            # Добавление chunk к полному ответу для БД
+            full_response_for_db += chunk
+            
+            # Очистка чанка от Markdown форматирования и конвертация в HTML
+            cleaned_chunk = await clean_html_for_telegram(chunk)
+            
+            # Добавление очищенного chunk к текущему тексту сообщения
+            current_message_text += cleaned_chunk
+            
+            # Проверка длины и разбиение при необходимости
+            if len(current_message_text) > TELEGRAM_MAX_LENGTH:
+                # Ищем место для "красивого" разрыва (по последнему \n перед лимитом)
+                split_pos = current_message_text[:TELEGRAM_MAX_LENGTH].rfind('\n')
+                if split_pos == -1:  # Если \n не найден, режем по лимиту
+                    split_pos = TELEGRAM_MAX_LENGTH
+                
+                text_to_send_now = current_message_text[:split_pos]
+                overflow_text = current_message_text[split_pos:].lstrip()  # Убираем пробелы в начале нового сообщения
+                
+                # Финальное редактирование старого сообщения
+                try:
+                    # Проверка HTML на валидность
+                    use_html = is_valid_html(text_to_send_now)
+                    if use_html:
+                        await message.bot.edit_message_text(
+                            text=text_to_send_now,
+                            chat_id=chat_id,
+                            message_id=current_message_id,
+                            parse_mode='HTML'
+                        )
                     else:
-                        # Если сам параграф слишком длинный, делим его грубо
-                        if len(paragraph) > TELEGRAM_MAX_LENGTH:
-                            if current_part.strip(): # Добавляем накопленное
-                                parts.append(current_part.strip())
-                            current_part = "" # Сбрасываем текущую часть
-                            # Делим длинный параграф
-                            for i in range(0, len(paragraph), TELEGRAM_MAX_LENGTH):
-                                parts.append(paragraph[i:i + TELEGRAM_MAX_LENGTH])
-                        else:
-                            # Добавляем накопленную часть и начинаем новую
-                            if current_part.strip():
-                                parts.append(current_part.strip())
-                            current_part = paragraph + "\n\n"
-
-                if current_part.strip(): # Добавляем последнюю часть
-                    parts.append(current_part.strip())
-
-                for i, part in enumerate(parts):
-                    logging.info(f"Отправка очищенной части {i+1}/{len(parts)} пользователю {user_id}")
-                    try:
-                        # Отправляем очищенную часть
-                        await message.answer(part, parse_mode='HTML')
-                        await asyncio.sleep(0.5) # Небольшая задержка
-                    except Exception as send_error:
-                        logging.error(f"Ошибка отправки части {i+1}: {send_error}")
-                        await message.answer(f"Ошибка при отправке части {i+1} ответа.")
-                        # Возможно, стоит прервать отправку остальных частей
-                        break
-            else:
-                # Отправляем очищенный ответ пользователю целиком
-                await message.answer(cleaned_response_text, parse_mode='HTML')
-
+                        # Удаляем HTML-теги вместо экранирования
+                        clean_text = strip_html_tags(text_to_send_now)
+                        await message.bot.edit_message_text(
+                            text=clean_text,
+                            chat_id=chat_id,
+                            message_id=current_message_id
+                        )
+                except TelegramAPIError as e:
+                    logging.error(f"Ошибка финализации части сообщения перед разделением: {e}")
+                
+                # Отправка нового сообщения с оставшимся текстом
+                try:
+                    # Удаляем HTML-теги для промежуточного сообщения вместо экранирования
+                    clean_overflow = strip_html_tags(overflow_text)
+                    new_message = await message.bot.send_message(
+                        chat_id=chat_id,
+                        text=clean_overflow + "..." if clean_overflow else "...",  # Показываем, что продолжение следует
+                        # Отключаем HTML-форматирование для промежуточных сообщений
+                        parse_mode=None
+                    )
+                    current_message_id = new_message.message_id
+                    current_message_text = overflow_text  # Начинаем накапливать для нового сообщения
+                    last_edit_time = time.monotonic()  # Сброс таймера
+                except TelegramAPIError as e:
+                    logging.error(f"Ошибка отправки следующей части сообщения после разделения: {e}")
+                    current_message_id = None  # Обнуляем ID, чтобы прервать дальнейшие попытки редактирования
+                    break  # Прерываем стрим
+            
+            # Троттлинг редактирования (если не было разбиения)
+            elif time.monotonic() - last_edit_time > edit_interval:
+                try:
+                    # Удаляем HTML-теги для промежуточного отображения вместо экранирования
+                    clean_text = strip_html_tags(current_message_text) + "..."  # Индикатор продолжения
+                    await message.bot.edit_message_text(
+                        text=clean_text,
+                        chat_id=chat_id,
+                        message_id=current_message_id,
+                        # Отключаем HTML-форматирование для промежуточных сообщений
+                        parse_mode=None
+                    )
+                    last_edit_time = time.monotonic()
+                except TelegramRetryAfter as e:
+                    logging.warning(f"Превышен лимит запросов, ожидание {e.retry_after}с")
+                    await asyncio.sleep(e.retry_after)
+                except TelegramAPIError as e:
+                    logging.error(f"Ошибка редактирования сообщения: {e}")
+                    # Если сообщение удалено, дальнейшее редактирование бессмысленно
+                    if "message to edit not found" in str(e).lower() or "message can't be edited" in str(e).lower():
+                        current_message_id = None  # Обнуляем ID
+                        break  # Прерываем цикл
+        
+        # После цикла (стрим завершен)
+        if placeholder_sent and current_message_id:
+            try:
+                # Проверяем, не осталось ли сообщение пустым
+                final_text = current_message_text if current_message_text else "Не удалось сгенерировать ответ."
+                
+                # Форматируем текст в HTML
+                final_html = await clean_html_for_telegram(final_text)
+                
+                # Проверка HTML на валидность перед отправкой с parse_mode='HTML'
+                use_html = is_valid_html(final_html)
+                if not use_html:
+                    logging.warning("Финальный текст содержит невалидный HTML, отправка без форматирования")
+                    # Просто удаляем все теги вместо экранирования
+                    final_text = strip_html_tags(final_text)
+                    await message.bot.edit_message_text(
+                        text=final_text,
+                        chat_id=chat_id,
+                        message_id=current_message_id,
+                        parse_mode=None
+                    )
+                else:
+                    # Отправляем с HTML-форматированием
+                    await message.bot.edit_message_text(
+                        text=final_html,
+                        chat_id=chat_id,
+                        message_id=current_message_id,
+                        parse_mode='HTML'
+                    )
+            except TelegramAPIError as e:
+                logging.error(f"Ошибка финального редактирования последнего сообщения: {e}")
+                # Пробуем отправить новым сообщением, если редактирование не удалось
+                try:
+                    # Отправляем текст без форматирования в случае ошибки
+                    clean_text = strip_html_tags(final_text)
+                    await message.answer(clean_text, parse_mode=None)
+                except Exception as e2:
+                    logging.error(f"Не удалось отправить финальный ответ новым сообщением: {e2}")
+        
+        elif not placeholder_sent and full_response_for_db:
+            # Если плейсхолдер не отправился, но ответ есть, отправить его новым сообщением
+            try:
+                cleaned_response = await clean_html_for_telegram(full_response_for_db)
+                # Проверка HTML на валидность
+                use_html = is_valid_html(cleaned_response)
+                await message.answer(cleaned_response, parse_mode='HTML' if use_html else None)
+            except TelegramAPIError as e:
+                logging.error(f"Ошибка отправки финального ответа новым сообщением: {e}")
+        
+        # Сохраняем ПОЛНЫЙ ответ в БД
+        if full_response_for_db:
+            await add_message_to_db(db, user_id, 'assistant', full_response_for_db)
+            logging.info(f"Полный ответ ассистента для пользователя {user_id} сохранен в БД")
         else:
-            # Отправляем сообщение об ошибке
-            logging.warning(f"Не удалось получить ответ от DeepSeek API для пользователя {user_id}")
-            await message.answer("Извините, произошла ошибка при обработке вашего запроса. Пожалуйста, попробуйте позже.")
+            logging.warning(f"Пустой ответ от DeepSeek API для пользователя {user_id}")
+            await message.answer("Извините, не удалось получить ответ от ассистента.")
+        
     except Exception as e:
         logging.exception(f"Непредвиденная ошибка для пользователя {user_id}: {e}")
         # Убедимся, что parse_mode не используется для простого сообщения об ошибке
@@ -841,6 +1054,104 @@ async def document_handler(message: types.Message, bot: Bot):
     # except Exception as e:
     #     logger.exception(f"Ошибка при скачивании документа {file_name}: {e}")
     #     await message.reply(f"Не удалось скачать документ {file_name}.")
+
+# Добавление вспомогательной функции для проверки HTML
+def strip_html_tags(text: str) -> str:
+    """Удаляет HTML-теги и экранированные HTML-теги из текста."""
+    try:
+        # Удаляем обычные HTML-теги
+        clean_text = re.sub(r'<[^>]*>', '', text)
+        
+        # Удаляем экранированные HTML-теги (&lt;tag&gt;)
+        clean_text = re.sub(r'&lt;[^&]*&gt;', '', clean_text)
+        
+        # Удаляем оставшиеся незакрытые теги
+        clean_text = re.sub(r'<[^>]*$', '', clean_text)
+        clean_text = re.sub(r'&lt;[^&]*$', '', clean_text)
+        
+        # Удаляем возможные HTML-сущности
+        html_entities = {
+            '&lt;': '<',
+            '&gt;': '>',
+            '&quot;': '"',
+            '&apos;': "'",
+            '&amp;': '&'
+        }
+        for entity, char in html_entities.items():
+            clean_text = clean_text.replace(entity, char)
+            
+        return clean_text
+    except Exception as e:
+        logging.error(f"Ошибка при удалении HTML-тегов: {e}")
+        return text  # Возвращаем исходный текст без изменений
+
+def is_valid_html(html_text: str) -> bool:
+    """Проверка на корректность HTML для отправки в Telegram.
+    
+    Проверяет, что все открытые теги правильно закрыты и поддерживаются Telegram.
+    """
+    try:
+        # Если нет HTML-тегов вообще, считаем валидным
+        if '<' not in html_text and '>' not in html_text:
+            return True
+            
+        # Проверяем базовые теги Telegram
+        tags_to_check = ['b', 'i', 'u', 's', 'code', 'pre', 'tg-spoiler']
+        
+        # Проверка простых тегов
+        for tag in tags_to_check:
+            # Ищем все теги заданного типа
+            open_tags = re.findall(f'<{tag}(?:\\s+[^>]*)?>', html_text, re.IGNORECASE)
+            close_tags = re.findall(f'</{tag}>', html_text, re.IGNORECASE)
+            
+            if len(open_tags) != len(close_tags):
+                logging.warning(f"Неравное количество открывающих и закрывающих тегов {tag}: {len(open_tags)} vs {len(close_tags)}")
+                return False
+                
+        # Проверка тега <a> с атрибутами
+        a_open_tags = re.findall(r'<a\s+[^>]*>', html_text)
+        a_close_tags = re.findall(r'</a>', html_text)
+        if len(a_open_tags) != len(a_close_tags):
+            logging.warning(f"Неравное количество тегов <a>: {len(a_open_tags)} vs {len(a_close_tags)}")
+            return False
+            
+        # Проверка на незакрытые угловые скобки
+        if html_text.count('<') != html_text.count('>'):
+            logging.warning("Несбалансированные угловые скобки в HTML")
+            return False
+            
+        # Проверка на экранированные теги, которые могли остаться
+        if '&lt;' in html_text or '&gt;' in html_text:
+            logging.warning("Найдены экранированные HTML-теги")
+            return False
+            
+        # Проверка на вложенные теги
+        stack = []
+        tag_pattern = re.compile(r'<(/?)([a-z0-9]+)(?:\s+[^>]*)?>', re.IGNORECASE)
+        
+        for match in tag_pattern.finditer(html_text):
+            is_closing = match.group(1) == '/'
+            tag_name = match.group(2).lower()
+            
+            if tag_name not in tags_to_check and tag_name != 'a':
+                continue  # Пропускаем неподдерживаемые теги
+                
+            if not is_closing:
+                stack.append(tag_name)
+            else:
+                if not stack or stack[-1] != tag_name:
+                    logging.warning(f"Неправильная вложенность тегов: закрывающий {tag_name}, но ожидался другой")
+                    return False
+                stack.pop()
+                
+        if stack:
+            logging.warning(f"Остались незакрытые теги: {stack}")
+            return False
+            
+        return True
+    except Exception as e:
+        logging.error(f"Ошибка при проверке HTML: {e}")
+        return False
 
 # Запуск бота
 if __name__ == "__main__":
