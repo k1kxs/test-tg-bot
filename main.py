@@ -15,6 +15,8 @@ import sqlite3
 import json
 import html
 import re
+import base64
+import io
 
 # Настройка логирования
 logging.basicConfig(
@@ -359,86 +361,80 @@ async def get_last_messages_postgres(pool: asyncpg.Pool, user_id: int, limit: in
         logging.exception(f"PostgreSQL: Непредвиденная ошибка: {e}")
         return []
 
-# Функция для получения ответа от DeepSeek API
+# Обновленная функция для работы с DeepSeek API, поддержка изображений УБРАНА из-за несовместимости API
 async def get_deepseek_response(api_key: str, system_prompt: str, history: list[dict]) -> str | None:
-    if not history:
-        logging.warning("История сообщений пуста")
-        
-    # Формируем сообщения для API
-    messages = [{'role': 'system', 'content': system_prompt}]
+    """
+    Отправляет запрос к DeepSeek API и возвращает ответ.
+    Включает историю переписки.
+    (Поддержка изображений временно удалена, т.к. стандартный endpoint ее не поддерживает)
+    """
+    url = "https://api.deepseek.com/chat/completions"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}"
+    }
+
+    # Убеждаемся, что история содержит только строки в 'content'
+    # (Предыдущая логика могла добавлять списки с image_url, которые теперь не поддерживаются)
+    valid_history = []
     for msg in history:
-        if msg.get('role') and msg.get('content'):
-            messages.append({'role': msg['role'], 'content': msg['content']})
-    
-    try:
-        # Увеличиваем таймауты для HTTP соединения
-        timeout = aiohttp.ClientTimeout(total=180, sock_read=150)
-        
-        logging.info(f"Отправка запроса к DeepSeek API с {len(messages)} сообщениями")
-        
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            url = "https://api.deepseek.com/v1/chat/completions"
-            headers = {
-                "Authorization": f"Bearer {api_key}", 
-                "Content-Type": "application/json"
-            }
-            payload = {
-                "model": "deepseek-chat", 
-                "messages": messages,
-                "temperature": 0.7,  # Возвращаем стандартное значение
-                "max_tokens": 4096  # Уменьшаем до ранее работавшего значения
-            }
-            
-            try:
-                # Использем метод текстового ответа вместо JSON для избежания проблем с парсингом
-                async with session.post(url, headers=headers, json=payload, raise_for_status=True) as response:
-                    if response.status == 200:
-                        # Читаем текст по частям для избежания таймаутов
-                        chunks = []
-                        async for chunk in response.content.iter_chunked(1024):
-                            chunks.append(chunk)
-                        
-                        # Объединяем чанки в один текст
-                        raw_response = b''.join(chunks).decode('utf-8')
-                        
-                        try:
-                            data = json.loads(raw_response)
-                            
-                            if not data.get('choices') or not data['choices']:
-                                logging.error(f"В ответе API отсутствует поле 'choices': {data}")
-                                return None
-                            
-                            message = data['choices'][0].get('message', {})
-                            content = message.get('content')
-                            
-                            if not content:
-                                logging.error(f"В ответе API отсутствует контент: {message}")
-                                return None
-                            
-                            logging.info("Успешно получен ответ от DeepSeek API")
-                            return content
-                        except json.JSONDecodeError as e:
-                            logging.error(f"Ошибка декодирования JSON: {e}, ответ API: {raw_response[:200]}...")
-                            return None
+        if isinstance(msg.get("content"), str):
+            valid_history.append(msg)
+        else:
+            # Пропускаем или логируем некорректные сообщения (например, с image_url)
+            logging.warning(f"Пропущено сообщение с некорректным форматом content для DeepSeek: {msg}")
+
+    messages = [{"role": "system", "content": system_prompt}] + valid_history
+
+    payload = {
+        "model": "deepseek-reasoner",
+        "messages": messages,
+        "max_tokens": 4000,
+        "temperature": 0.7,
+        "stream": False
+    }
+
+    connector = aiohttp.TCPConnector(family=socket.AF_INET)
+
+    async with aiohttp.ClientSession(connector=connector) as session:
+        try:
+            logging.info(f"Отправка запроса к DeepSeek API. Последнее сообщение: {messages[-1] if messages else 'No messages'}")
+
+            async with session.post(url, headers=headers, json=payload, timeout=120) as response:
+                response_text = await response.text()
+
+                if response.status == 200:
+                    data = json.loads(response_text)
+                    if data.get("choices") and len(data["choices"]) > 0:
+                        content = data["choices"][0].get("message", {}).get("content")
+                        if content:
+                             logging.info("Успешно получен ответ от DeepSeek API")
+                             return str(content)
+                        else:
+                             logging.warning("Ответ от DeepSeek API не содержит 'content'")
+                             return "Извините, не смог получить ответ от DeepSeek."
                     else:
-                        error_text = await response.text()
-                        logging.error(f"Ошибка API: статус {response.status}, ответ: {error_text}")
-                        return None
-            except aiohttp.ClientResponseError as e:
-                logging.error(f"Ошибка ответа API: {e}")
-                return None
-            except aiohttp.ClientPayloadError as e:
-                logging.error(f"Ошибка загрузки данных от API: {e}")
-                return None
-            except asyncio.TimeoutError:
-                logging.error("Превышено время ожидания ответа от API")
-                return None
-    except aiohttp.ClientConnectorError as e:
-        logging.error(f"Ошибка подключения к API: {e}")
-        return None
-    except Exception as e:
-        logging.exception(f"Неожиданная ошибка при обращении к DeepSeek API: {e}")
-        return None
+                        logging.warning("Ответ от DeepSeek API не содержит 'choices'")
+                        return "Извините, структура ответа от DeepSeek неожиданная."
+                elif response.status == 422: # Добавим обработку конкретно 422 ошибки
+                    logging.error(f"Ошибка валидации данных (422) при запросе к DeepSeek: {response_text}")
+                    return f"Ошибка API DeepSeek (422): Неверный формат запроса. Ответ: {response_text[:200]}..."
+                else:
+                    logging.error(f"Ошибка API DeepSeek: Статус {response.status}, Ответ: {response_text}")
+                    return f"Ошибка при обращении к API DeepSeek: {response.status}"
+
+        except asyncio.TimeoutError:
+            logging.error("Ошибка API DeepSeek: Таймаут запроса")
+            return "Извините, запрос к DeepSeek занял слишком много времени."
+        except aiohttp.ClientError as e:
+            logging.error(f"Ошибка сети при запросе к DeepSeek: {e}")
+            return f"Сетевая ошибка при подключении к DeepSeek: {e}"
+        except json.JSONDecodeError as e:
+            logging.error(f"Ошибка декодирования JSON ответа DeepSeek: {e}. Ответ: {response_text}")
+            return "Не удалось обработать ответ от DeepSeek (ошибка JSON)."
+        except Exception as e:
+            logging.exception(f"Неожиданная ошибка при запросе к DeepSeek: {e}")
+            return f"Произошла непредвиденная ошибка: {e}"
 
 # Обработчик команды /start
 @dp.message(Command("start"))
@@ -449,7 +445,7 @@ async def start_handler(message: types.Message):
     
     await message.answer("Привет! Я медицинский ассистент. Задайте ваш вопрос.", reply_markup=builder.as_markup())
 
-# Обработчик текстовых сообщений
+# Обработчик текстовых сообщений (основная логика)
 @dp.message(F.text)
 async def message_handler(message: types.Message):
     user_id = message.from_user.id
@@ -706,6 +702,145 @@ async def clear_command_handler(message: types.Message):
     except Exception as e:
         logging.error(f"Неожиданная ошибка при очистке истории: {e}")
         await message.answer("Произошла ошибка при очистке истории")
+
+# НОВЫЙ: Обработчик сообщений с фото (Обновлен: сообщает о неподдержке)
+@dp.message(F.photo)
+async def photo_handler(message: types.Message, bot: Bot):
+    """Обрабатывает сообщения с фотографиями."""
+    user_id = message.from_user.id
+    photo = message.photo[-1]
+    file_id = photo.file_id
+    caption = message.caption # Получаем подпись к фото
+
+    logger.info(f"Получено фото от user_id={user_id} (file_id: {file_id}). Подпись: {caption}")
+
+    await message.reply(
+        "Получил фото. К сожалению, текущая конфигурация API DeepSeek не поддерживает анализ изображений через этот endpoint. "
+        "Если вы добавили подпись к фото, я обработаю ее как обычный текст."
+    )
+
+    # Если есть подпись, обрабатываем ее как обычное текстовое сообщение
+    if caption:
+        logger.info(f"Обработка подписи к фото как текста для user_id={user_id}")
+        # Создаем новое "виртуальное" сообщение с текстом из подписи
+        # и передаем его в обычный message_handler
+        # Важно: message_handler ожидает объект message, создадим аналог
+        # с необходимыми полями или вызовем его логику напрямую.
+        # Простой вариант: вызвать основную логику обработки текста.
+
+        # Получаем зависимости (аналогично message_handler)
+        db = dp.workflow_data.get('db')
+        settings_local = dp.workflow_data.get('settings') # Используем другое имя, чтобы не конфликтовать с глобальным settings
+
+        if not db or not settings_local:
+            logging.error("Не удалось получить зависимости для обработки подписи к фото")
+            await message.reply("Произошла внутренняя ошибка при попытке обработать подпись к фото.")
+            return
+
+        await message.bot.send_chat_action(chat_id=user_id, action="typing")
+
+        try:
+            # Сохраняем подпись как сообщение пользователя
+            await add_message_to_db(db, user_id, "user", caption)
+            logging.info(f"Подпись к фото от пользователя {user_id} сохранена")
+
+            # Получаем историю сообщений (включая только что добавленную подпись)
+            history = await get_last_messages(db, user_id, limit=CONVERSATION_HISTORY_LIMIT)
+            logging.info(f"Получена история сообщений для пользователя {user_id} (с подписью), записей: {len(history)}")
+
+            # Получаем ответ от DeepSeek API (только на основе текста)
+            response_text = await get_deepseek_response(settings_local.DEEPSEEK_API_KEY, SYSTEM_PROMPT, history)
+
+            if response_text:
+                cleaned_response_text = await clean_html_for_telegram(response_text)
+                await add_message_to_db(db, user_id, "assistant", response_text) # Сохраняем оригинал
+                logging.info(f"Ответ ассистента (на подпись) для пользователя {user_id} сохранен")
+
+                # Отправляем ответ (как в message_handler)
+                if len(cleaned_response_text) > TELEGRAM_MAX_LENGTH:
+                    # ... (логика разделения на части, как в message_handler)
+                    logging.info(f"Очищенный ответ (на подпись) слишком длинный ({len(cleaned_response_text)} символов), разделяю на части.")
+                    parts = []
+                    current_part = ""
+                    for paragraph in cleaned_response_text.split('\n\n'):
+                        if len(current_part) + len(paragraph) + 2 <= TELEGRAM_MAX_LENGTH:
+                            current_part += paragraph + "\n\n"
+                        else:
+                            if len(paragraph) > TELEGRAM_MAX_LENGTH:
+                                if current_part.strip():
+                                    parts.append(current_part.strip())
+                                current_part = ""
+                                for i in range(0, len(paragraph), TELEGRAM_MAX_LENGTH):
+                                    parts.append(paragraph[i:i + TELEGRAM_MAX_LENGTH])
+                            else:
+                                if current_part.strip():
+                                    parts.append(current_part.strip())
+                                current_part = paragraph + "\n\n"
+                    if current_part.strip():
+                        parts.append(current_part.strip())
+                    for i, part in enumerate(parts):
+                        logging.info(f"Отправка очищенной части {i+1}/{len(parts)} (на подпись) пользователю {user_id}")
+                        try:
+                            await message.answer(part, parse_mode='HTML') # Отвечаем на исходное сообщение с фото
+                            await asyncio.sleep(0.5)
+                        except Exception as send_error:
+                            logging.error(f"Ошибка отправки части {i+1} (на подпись): {send_error}")
+                            await message.answer(f"Ошибка при отправке части {i+1} ответа на подпись.")
+                            break
+                else:
+                    await message.answer(cleaned_response_text, parse_mode='HTML') # Отвечаем на исходное сообщение с фото
+            else:
+                logging.warning(f"Не удалось получить ответ от DeepSeek API на подпись к фото для пользователя {user_id}")
+                await message.reply("Извините, произошла ошибка при обработке вашей подписи к фото.")
+
+        except Exception as e:
+            logging.exception(f"Ошибка при обработке подписи к фото для user_id={user_id}: {e}")
+            await message.reply("Произошла ошибка при обработке подписи к фото.")
+
+    # --- Логика скачивания и обработки base64 УДАЛЕНА --- 
+    # try:
+    #     # Скачиваем фото в память
+    #     file_info = await bot.get_file(file_id)
+    #     ...
+    #     image_base64 = base64.b64encode(file_content.read()).decode('utf-8')
+    #     ...
+    #     # Отправляем запрос в DeepSeek с изображением
+    #     response_text = await get_deepseek_response(
+    #         ...
+    #         image_data=image_base64 # Передаем base64 изображения
+    #     )
+    #     ...
+    # except Exception as e:
+    #     ...
+    # ----------------------------------------------------
+
+# НОВЫЙ: Обработчик сообщений с документами
+@dp.message(F.document)
+async def document_handler(message: types.Message, bot: Bot):
+    """Обрабатывает сообщения с документами."""
+    user_id = message.from_user.id
+    document = message.document
+    file_id = document.file_id
+    file_name = document.file_name
+    mime_type = document.mime_type
+
+    logger.info(f"Получен документ от user_id={user_id}: {file_name} (type: {mime_type})")
+
+    # Пока просто отвечаем, что обработка документов в разработке
+    # TODO: Реализовать скачивание и обработку документов (например, извлечение текста)
+    await message.reply(f"Получил документ '{file_name}'. Обработка документов пока не реализована.")
+
+    # Пример скачивания (закомментировано, т.к. пока не используется):
+    # try:
+    #     file_info = await bot.get_file(file_id)
+    #     file_path = file_info.file_path
+    #     file_content = await bot.download_file(file_path)
+    #     # Дальнейшая обработка file_content (например, чтение текста)
+    #     file_content.close()
+    #     await message.reply(f"Скачал {file_name}, но пока не знаю, что с ним делать.")
+    # except Exception as e:
+    #     logger.exception(f"Ошибка при скачивании документа {file_name}: {e}")
+    #     await message.reply(f"Не удалось скачать документ {file_name}.")
 
 # Запуск бота
 if __name__ == "__main__":
