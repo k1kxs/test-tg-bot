@@ -13,21 +13,27 @@ import socket
 import os
 import sqlite3
 import json
-import html
 import re
 import base64
 import io
 import typing
 import time
 from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
-from aiogram.utils.text_decorations import html_decoration
+
+# Добавим переменную для управления режимом отладки
+DEBUG_HTML = os.environ.get('DEBUG_HTML', 'False').lower() in ('true', '1', 't')
 
 # Настройка логирования
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG if DEBUG_HTML else logging.INFO,
     format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
     handlers=[logging.StreamHandler()]
 )
+
+if DEBUG_HTML:
+    logging.info("Включен режим отладки HTML-форматирования")
+else:
+    logging.info("Режим отладки HTML-форматирования отключен (установите DEBUG_HTML=True для включения)")
 
 logger = logging.getLogger(__name__)
 
@@ -69,11 +75,6 @@ Follow in the strict order:
 I'll answer as the world-famous <specific field> scientists with <most prestigious LOCAL award>
 
 <Deep knowledge step-by-step answer, with CONCRETE details>
-
-# Telegram Formatting Instructions (HTML):
-# - Your response MUST be formatted exclusively using these Telegram-supported HTML tags: <b>bold</b>, <i>italic</i>, <u>underline</u>, <s>strikethrough</s>, <tg-spoiler>spoiler</tg-spoiler>, <code>inline code</code>, <pre>code block</pre>, <a href='URL'>link</a>.
-# - It is absolutely forbidden to use any Markdown syntax. This includes, but is not limited to: **bold**, *italic*, _italic_, `inline code`, ```code blocks```, # Headers (any level, like ## or ####), > blockquotes, - or * list items.
-# - The final output must be directly usable in Telegram with parse_mode=HTML without any further processing. Ensure NO Markdown formatting remains.
 """
 CONVERSATION_HISTORY_LIMIT = 10
 MESSAGE_EXPIRATION_DAYS = 7
@@ -84,114 +85,6 @@ TELEGRAM_MAX_LENGTH = 4000
 # Обновленный паттерн для разрешенных HTML тегов Telegram
 ALLOWED_TAGS_PATTERN_TEXT = r"</?(?:b|i|u|s|tg-spoiler|code|pre|a(?:\s+href\s*=\s*(?:\"[^\"]*\"|'[^\']*'))?)\s*>/?"
 ALLOWED_TAGS_PATTERN = re.compile(ALLOWED_TAGS_PATTERN_TEXT, re.IGNORECASE)
-
-async def clean_html_for_telegram(text: str) -> str:
-    """
-    Преобразует Markdown в HTML, обрабатывает таблицы и очищает HTML
-    для безопасной отправки в Telegram с parse_mode=HTML.
-    Также добавляет отступы для иерархической структуры текста.
-    """
-    if not text:
-        return ""
-
-    # Удаляем существующие HTML-теги перед форматированием для избежания конфликтов
-    text = strip_html_tags(text)
-        
-    # 1. Конвертация Markdown в HTML (порядок важен)
-    try:
-        # Определение уровней заголовков для отступов
-        heading_level = {}
-        current_level = 0
-        indent_char = "    "  # 4 пробела для отступа
-        
-        # Функция для добавления отступов
-        def add_indent(match):
-            nonlocal current_level
-            header_text = match.group(2)
-            # Используем количество # для определения уровня
-            level = len(match.group(1))
-            if level > 0:
-                # Запоминаем уровень заголовка
-                heading_level[header_text] = level
-                # Заголовок первого уровня - без отступа
-                current_level = level - 1
-                indentation = indent_char * current_level if current_level > 0 else ""
-                return f"{indentation}<b>{header_text}</b>"
-            return f"<b>{header_text}</b>"
-            
-        # Заголовки с отступами
-        text = re.sub(r'^(#{1,6})\s+(.+)$', add_indent, text, flags=re.MULTILINE)
-        
-        # Блоки кода (самые приоритетные из-за символов внутри)
-        text = re.sub(r"^\s*```([^\n]*)\n(.*?)\n```", r"<pre>\2</pre>", text, flags=re.DOTALL | re.MULTILINE)
-        text = re.sub(r"^\s*```()\n(.*?)\n```", r"<pre>\2</pre>", text, flags=re.DOTALL | re.MULTILINE) # Без языка
-
-        # Встроенный код (моноширный)
-        text = re.sub(r"`([^`\n]+)`", r"<code>\1</code>", text)
-
-        # Жирный и подчеркнутый
-        text = re.sub(r"\*\*(.*?)\*\*", r"<b>\1</b>", text)
-        text = re.sub(r"__(.*?)__", r"<u>\1</u>", text) # Используем <u> для подчеркивания
-
-        # Курсив
-        text = re.sub(r"\*(.*?)\*", r"<i>\1</i>", text)
-        text = re.sub(r"_(.*?)_", r"<i>\1</i>", text) # Используем <i> для курсива
-
-        # Зачеркнутый
-        text = re.sub(r"~~(.*?)~~", r"<s>\1</s>", text)
-
-        # Списки с отступами
-        indent_level = 0
-        
-        def indent_list_item(match):
-            nonlocal indent_level
-            item_text = match.group(0)
-            leading_spaces = len(item_text) - len(item_text.lstrip())
-            # Определение уровня вложенности на основе отступа
-            indent_level = leading_spaces // 2  # примерно 2 пробела = 1 уровень
-            indentation = indent_char * indent_level
-            return f"{indentation}• {match.group(1)}"
-            
-        text = re.sub(r"^\s*[-*+]\s+(.*?)$", indent_list_item, text, flags=re.MULTILINE)
-
-        # --- Обработка таблиц ---
-        # Найти блоки, похожие на таблицы Markdown
-        table_pattern = re.compile(r"(?:^\|.*\|$\n?)+", re.MULTILINE)
-
-        def format_table(match):
-            table_content = match.group(0).strip()
-            # Экранируем HTML внутри таблицы и оборачиваем в <pre>
-            escaped_table_content = html.escape(table_content)
-            return f"<pre>{escaped_table_content}</pre>\n"
-
-        text = table_pattern.sub(format_table, text)
-        # --- Конец обработки таблиц ---
-
-    except Exception as e:
-        logging.error(f"Ошибка на этапе конвертации Markdown: {e}")
-        # В случае ошибки возвращаем текст без форматирования
-        return text
-
-    # Финальная проверка для защиты от ошибок форматирования
-    if not is_valid_html(text):
-        logging.warning("HTML невалиден после форматирования, возвращаем исходный текст")
-        return text
-        
-    return text
-
-def has_partial_html_tags(text: str) -> bool:
-    """Проверяет, есть ли незакрытые или частичные HTML-теги в тексте."""
-    # Считаем открывающие и закрывающие скобки
-    if text.count('<') != text.count('>'):
-        return True
-    
-    # Проверим самые популярные теги
-    tags = ['b', 'i', 'u', 's', 'code', 'pre', 'a', 'tg-spoiler']
-    for tag in tags:
-        if text.count(f'<{tag}') != text.count(f'</{tag}>'):
-            return True
-    
-    return False
 
 # Класс настроек
 class Settings(BaseSettings):
@@ -586,10 +479,12 @@ async def message_handler(message: types.Message):
         # Инициализация переменных для стриминга
         full_response_for_db = ""  # Для сохранения всего ответа в БД
         current_message_text = ""  # Текст для текущего редактируемого сообщения
+        formatted_message_text = ""  # Отформатированный текст для отображения
         current_message_id = None  # ID текущего редактируемого сообщения
         last_edit_time = time.monotonic()  # Время последнего редактирования
         edit_interval = 1.0  # Интервал троттлинга (секунды)
         placeholder_sent = False  # Флаг, отправлен ли плейсхолдер
+        use_formatting = False  # Отключено форматирование
         
         # Стрим ответа от DeepSeek API
         async for chunk in stream_deepseek_response(settings.DEEPSEEK_API_KEY, SYSTEM_PROMPT, history):
@@ -609,17 +504,24 @@ async def message_handler(message: types.Message):
             if not current_message_id:
                 break
                 
-            # Добавление chunk к полному ответу для БД
+            # Добавление chunk к полному ответу для БД и накопление сырого текста
             full_response_for_db += chunk
+            current_message_text += chunk
             
-            # Очистка чанка от Markdown форматирования и конвертация в HTML
-            cleaned_chunk = await clean_html_for_telegram(chunk)
-            
-            # Добавление очищенного chunk к текущему тексту сообщения
-            current_message_text += cleaned_chunk
+            # Форматируем текст для отображения в процессе стриминга
+            if use_formatting:
+                try:
+                    # Применяем безопасное форматирование через улучшенную функцию
+                    formatted_message_text = await apply_stream_formatting(current_message_text)
+                except Exception as format_error:
+                    logging.error(f"Ошибка форматирования в процессе стриминга: {format_error}")
+                    formatted_message_text = current_message_text
+                    use_formatting = False  # Отключаем форматирование при ошибке
+            else:
+                formatted_message_text = current_message_text
             
             # Проверка длины и разбиение при необходимости
-            if len(current_message_text) > TELEGRAM_MAX_LENGTH:
+            if len(formatted_message_text) > TELEGRAM_MAX_LENGTH:
                 # Ищем место для "красивого" разрыва (по последнему \n перед лимитом)
                 split_pos = current_message_text[:TELEGRAM_MAX_LENGTH].rfind('\n')
                 if split_pos == -1:  # Если \n не найден, режем по лимиту
@@ -628,130 +530,413 @@ async def message_handler(message: types.Message):
                 text_to_send_now = current_message_text[:split_pos]
                 overflow_text = current_message_text[split_pos:].lstrip()  # Убираем пробелы в начале нового сообщения
                 
-                # Финальное редактирование старого сообщения
-                try:
-                    # Проверка HTML на валидность
-                    use_html = is_valid_html(text_to_send_now)
-                    if use_html:
+                # Форматируем текст перед отправкой если включено форматирование
+                if use_formatting:
+                    try:
+                        # Применяем безопасное форматирование
+                        formatted_text_to_send = await apply_stream_markdown(text_to_send_now)
+                        
+                        # Проверяем валидность HTML перед отправкой
+                        if is_stream_html_valid(formatted_text_to_send):
+                            # Безопасно отправляем с форматированием
+                            await message.bot.edit_message_text(
+                                text=formatted_text_to_send,
+                                chat_id=chat_id,
+                                message_id=current_message_id,
+                                parse_mode='HTML'
+                            )
+                        else:
+                            # Если HTML невалиден, попробуем исправить
+                            fixed_html = fix_streaming_html(formatted_text_to_send)
+                            if is_stream_html_valid(fixed_html):
+                                await message.bot.edit_message_text(
+                                    text=fixed_html,
+                                    chat_id=chat_id,
+                                    message_id=current_message_id,
+                                    parse_mode='HTML'
+                                )
+                            else:
+                                # Если и после исправления невалиден, отправляем без форматирования
+                                await message.bot.edit_message_text(
+                                    text=strip_html_tags(text_to_send_now),
+                                    chat_id=chat_id,
+                                    message_id=current_message_id
+                                )
+                    except Exception as e:
+                        logging.error(f"Ошибка форматирования перед разделением: {e}")
                         await message.bot.edit_message_text(
                             text=text_to_send_now,
                             chat_id=chat_id,
-                            message_id=current_message_id,
-                            parse_mode='HTML'
-                        )
-                    else:
-                        # Удаляем HTML-теги вместо экранирования
-                        clean_text = strip_html_tags(text_to_send_now)
-                        await message.bot.edit_message_text(
-                            text=clean_text,
-                            chat_id=chat_id,
                             message_id=current_message_id
                         )
-                except TelegramAPIError as e:
-                    logging.error(f"Ошибка финализации части сообщения перед разделением: {e}")
+                else:
+                    # Отправляем текст без форматирования
+                    await message.bot.edit_message_text(
+                        text=text_to_send_now,
+                        chat_id=chat_id,
+                        message_id=current_message_id
+                    )
                 
                 # Отправка нового сообщения с оставшимся текстом
                 try:
-                    # Удаляем HTML-теги для промежуточного сообщения вместо экранирования
-                    clean_overflow = strip_html_tags(overflow_text)
                     new_message = await message.bot.send_message(
                         chat_id=chat_id,
-                        text=clean_overflow + "..." if clean_overflow else "...",  # Показываем, что продолжение следует
-                        # Отключаем HTML-форматирование для промежуточных сообщений
-                        parse_mode=None
+                        text=overflow_text + "..." if overflow_text else "...",
+                        parse_mode=None  # Начальное сообщение всегда без форматирования
                     )
                     current_message_id = new_message.message_id
                     current_message_text = overflow_text  # Начинаем накапливать для нового сообщения
                     last_edit_time = time.monotonic()  # Сброс таймера
                 except TelegramAPIError as e:
-                    logging.error(f"Ошибка отправки следующей части сообщения после разделения: {e}")
+                    logging.error(f"Ошибка отправки следующей части сообщения: {e}")
                     current_message_id = None  # Обнуляем ID, чтобы прервать дальнейшие попытки редактирования
                     break  # Прерываем стрим
             
             # Троттлинг редактирования (если не было разбиения)
             elif time.monotonic() - last_edit_time > edit_interval:
                 try:
-                    # Удаляем HTML-теги для промежуточного отображения вместо экранирования
-                    clean_text = strip_html_tags(current_message_text) + "..."  # Индикатор продолжения
-                    await message.bot.edit_message_text(
-                        text=clean_text,
-                        chat_id=chat_id,
-                        message_id=current_message_id,
-                        # Отключаем HTML-форматирование для промежуточных сообщений
-                        parse_mode=None
-                    )
+                    # Обновляем промежуточное сообщение с применением форматирования при включенном режиме
+                    if use_formatting:
+                        # Проверяем валидность HTML перед отправкой
+                        if is_stream_html_valid(formatted_message_text):
+                            await message.bot.edit_message_text(
+                                text=formatted_message_text + "...",
+                                chat_id=chat_id,
+                                message_id=current_message_id,
+                                parse_mode='HTML'
+                            )
+                        else:
+                            # Если HTML невалиден, пробуем исправить
+                            fixed_html = fix_streaming_html(formatted_message_text)
+                            if is_stream_html_valid(fixed_html):
+                                await message.bot.edit_message_text(
+                                    text=fixed_html + "...",
+                                    chat_id=chat_id,
+                                    message_id=current_message_id,
+                                    parse_mode='HTML'
+                                )
+                            else:
+                                # Если исправить не удалось, отправляем без форматирования
+                                await message.bot.edit_message_text(
+                                    text=current_message_text + "...",
+                                    chat_id=chat_id,
+                                    message_id=current_message_id
+                                )
+                                use_formatting = False  # Отключаем форматирование при ошибке
+                    else:
+                        # Используем обычный текст если форматирование отключено или HTML невалиден
+                        await message.bot.edit_message_text(
+                            text=current_message_text + "...",
+                            chat_id=chat_id,
+                            message_id=current_message_id
+                        )
                     last_edit_time = time.monotonic()
                 except TelegramRetryAfter as e:
                     logging.warning(f"Превышен лимит запросов, ожидание {e.retry_after}с")
                     await asyncio.sleep(e.retry_after)
                 except TelegramAPIError as e:
                     logging.error(f"Ошибка редактирования сообщения: {e}")
-                    # Если сообщение удалено, дальнейшее редактирование бессмысленно
-                    if "message to edit not found" in str(e).lower() or "message can't be edited" in str(e).lower():
-                        current_message_id = None  # Обнуляем ID
-                        break  # Прерываем цикл
+                    # Пробуем отправить без форматирования
+                    try:
+                        await message.bot.edit_message_text(
+                            text=current_message_text + "...",
+                            chat_id=chat_id,
+                            message_id=current_message_id
+                        )
+                        last_edit_time = time.monotonic()
+                        use_formatting = False  # Отключаем форматирование при ошибке
+                    except TelegramAPIError as plain_error:
+                        logging.error(f"Ошибка редактирования без форматирования: {plain_error}")
+                        # Если сообщение удалено, дальнейшее редактирование бессмысленно
+                        if "message to edit not found" in str(plain_error).lower() or "message can't be edited" in str(plain_error).lower():
+                            current_message_id = None  # Обнуляем ID
+                            break  # Прерываем цикл
         
-        # После цикла (стрим завершен)
-        if placeholder_sent and current_message_id:
+        # После цикла (стрим завершен) - сохраняем полный ответ в БД без дублирования сообщения
+        if placeholder_sent:
             try:
-                # Проверяем, не осталось ли сообщение пустым
-                final_text = current_message_text if current_message_text else "Не удалось сгенерировать ответ."
-                
-                # Форматируем текст в HTML
-                final_html = await clean_html_for_telegram(final_text)
-                
-                # Проверка HTML на валидность перед отправкой с parse_mode='HTML'
-                use_html = is_valid_html(final_html)
-                if not use_html:
-                    logging.warning("Финальный текст содержит невалидный HTML, отправка без форматирования")
-                    # Просто удаляем все теги вместо экранирования
-                    final_text = strip_html_tags(final_text)
-                    await message.bot.edit_message_text(
-                        text=final_text,
-                        chat_id=chat_id,
-                        message_id=current_message_id,
-                        parse_mode=None
-                    )
-                else:
-                    # Отправляем с HTML-форматированием
-                    await message.bot.edit_message_text(
-                        text=final_html,
-                        chat_id=chat_id,
-                        message_id=current_message_id,
-                        parse_mode='HTML'
-                    )
-            except TelegramAPIError as e:
-                logging.error(f"Ошибка финального редактирования последнего сообщения: {e}")
-                # Пробуем отправить новым сообщением, если редактирование не удалось
-                try:
-                    # Отправляем текст без форматирования в случае ошибки
-                    clean_text = strip_html_tags(final_text)
-                    await message.answer(clean_text, parse_mode=None)
-                except Exception as e2:
-                    logging.error(f"Не удалось отправить финальный ответ новым сообщением: {e2}")
-        
-        elif not placeholder_sent and full_response_for_db:
-            # Если плейсхолдер не отправился, но ответ есть, отправить его новым сообщением
-            try:
-                cleaned_response = await clean_html_for_telegram(full_response_for_db)
-                # Проверка HTML на валидность
-                use_html = is_valid_html(cleaned_response)
-                await message.answer(cleaned_response, parse_mode='HTML' if use_html else None)
-            except TelegramAPIError as e:
-                logging.error(f"Ошибка отправки финального ответа новым сообщением: {e}")
-        
-        # Сохраняем ПОЛНЫЙ ответ в БД
-        if full_response_for_db:
-            await add_message_to_db(db, user_id, 'assistant', full_response_for_db)
-            logging.info(f"Полный ответ ассистента для пользователя {user_id} сохранен в БД")
-        else:
-            logging.warning(f"Пустой ответ от DeepSeek API для пользователя {user_id}")
-            await message.answer("Извините, не удалось получить ответ от ассистента.")
-        
+                final_text = full_response_for_db or "Не удалось сгенерировать ответ."
+                await add_message_to_db(db, user_id, "assistant", final_text)
+                logging.info(f"Ответ ассистента для пользователя {user_id} сохранен")
+            except Exception as e:
+                logging.error(f"Ошибка сохранения ответа: {e}")
+    
     except Exception as e:
-        logging.exception(f"Непредвиденная ошибка для пользователя {user_id}: {e}")
-        # Убедимся, что parse_mode не используется для простого сообщения об ошибке
-        await message.answer("Произошла ошибка при обработке сообщения")
+        logging.exception(f"Критическая ошибка в обработчике сообщений: {e}")
+        await message.answer("Произошла ошибка при обработке вашего запроса, попробуйте позже или обратитесь в поддержку.")
+
+# Функция для простого форматирования текста в процессе стриминга
+async def apply_stream_formatting(text: str) -> str:
+    """Преобразует текст модели в Telegram Markdown во время стриминга."""
+    return format_markdown(text)
+
+def format_markdown(text: str) -> str:
+    """Преобразует Markdown из модели в Telegram Markdown формат."""
+    # Сохраняем блоки кода
+    code_blocks = []
+    def repl_block(m):
+        code_blocks.append(m.group(1))
+        return f"<<BLOCK{len(code_blocks)-1}>>"
+    text = re.sub(r'```([\s\S]+?)```', repl_block, text)
+
+    # Сохраняем inline код
+    inline_codes = []
+    def repl_inline(m):
+        inline_codes.append(m.group(1))
+        return f"<<INLINE{len(inline_codes)-1}>>"
+    text = re.sub(r'`([^`\n]+?)`', repl_inline, text)
+
+    # Заголовки # -> __**text**__
+    def repl_header(m):
+        return f"__**{m.group(2).strip()}**__"
+    text = re.sub(r'^(#{1,6})\s+(.+)$', repl_header, text, flags=re.MULTILINE)
+
+    # Жирный ** оставляем
+    # Курсив *text* или _text_ -> __text__
+    text = re.sub(r'\*(?!\*)([^*\n]+?)\*(?!\*)', r'__\1__', text)
+    text = re.sub(r'_(?!_)([^_\n]+?)_(?!_)', r'__\1__', text)
+
+    # Восстановление inline кода
+    for i, code in enumerate(inline_codes):
+        text = text.replace(f"<<INLINE{i}>>", f"`{code}`")
+
+    # Восстановление блоков кода
+    for i, code in enumerate(code_blocks):
+        text = text.replace(f"<<BLOCK{i}>>", f"```{code}```")
+
+    return text
+
+def is_stream_html_valid(text: str) -> bool:
+    """
+    Проверяет, что HTML в тексте валиден для потокового обновления сообщения.
+    Проверяет баланс основных тегов, которые могут использоваться при форматировании.
+    """
+    try:
+        if not text or '<' not in text:
+            return True
+        
+        # Проверяем наличие экранированных HTML-сущностей, которые могут вызвать проблемы
+        problematic_entities = ['&lt;b&gt;', '&lt;i&gt;', '&lt;u&gt;', '&lt;s&gt;', '&lt;code&gt;', '&lt;pre&gt;']
+        for entity in problematic_entities:
+            if entity in text.lower():
+                return False
+                
+        # Проверяем наличие одиночных неэкранированных угловых скобок
+        # Паттерны, которые могут указывать на одиночные скобки не в HTML-тегах
+        if re.search(r'<(?![a-zA-Z/])|(?<![a-zA-Z\s/"\'`])>', text):
+            return False
+        
+        # Проверяем баланс основных HTML тегов, которые могут быть в форматировании
+        tags_to_check = ['b', 'i', 'u', 's', 'code', 'pre']
+        
+        for tag in tags_to_check:
+            open_count = text.count(f'<{tag}>')
+            close_count = text.count(f'</{tag}>')
+            
+            if open_count != close_count:
+                return False
+        
+        # Дополнительная проверка на баланс угловых скобок
+        open_brackets = text.count('<')
+        close_brackets = text.count('>')
+        
+        if open_brackets != close_brackets:
+            return False
+        
+        # Проверка на наличие незавершенных тегов в конце строки
+        if text.rstrip().endswith('<'):
+            return False
+            
+        # Проверка на незавершенные открывающие теги (например <b без >)
+        if re.search(r'<[a-zA-Z][a-zA-Z0-9]*(?![^<>]*>)', text):
+            return False
+            
+        # Проверка на вложенность тегов и их правильную последовательность закрытия
+        stack = []
+        i = 0
+        while i < len(text):
+            if text[i:i+1] == '<':
+                if i + 1 < len(text) and text[i+1:i+2] == '/':
+                    # Закрывающий тег
+                    end = text.find('>', i)
+                    if end == -1:
+                        return False  # Незакрытая угловая скобка
+                    
+                    tag_name = text[i+2:end].strip().lower()
+                    if not stack or stack[-1] != tag_name:
+                        return False  # Несбалансированный тег
+                    
+                    stack.pop()
+                    i = end + 1
+                else:
+                    # Открывающий тег
+                    end = text.find('>', i)
+                    if end == -1:
+                        return False  # Незакрытая угловая скобка
+                    
+                    tag_content = text[i+1:end].strip().lower()
+                    # Пропускаем самозакрывающиеся теги или нестандартные теги
+                    if ' ' in tag_content or tag_content.endswith('/'):
+                        i = end + 1
+                        continue
+                    
+                    if tag_content in tags_to_check:
+                        stack.append(tag_content)
+                    
+                    i = end + 1
+            else:
+                i += 1
+        
+        # Проверяем, что все открытые теги закрыты
+        if stack:
+            return False
+            
+        # Проверка на неправильную последовательность вложенных тегов (например <b><i></b></i>)
+        for tag1 in tags_to_check:
+            for tag2 in tags_to_check:
+                if tag1 != tag2:
+                    pattern = f'<{tag1}>[^<]*<{tag2}>[^<]*</{tag1}>[^<]*</{tag2}>'
+                    if re.search(pattern, text):
+                        return False
+        
+        return True
+    except Exception as e:
+        logging.error(f"Ошибка в is_stream_html_valid: {e}")
+        return False
+
+def fix_streaming_html(text: str) -> str:
+    """
+    Исправляет HTML для потоковой передачи, обеспечивая правильную балансировку тегов.
+    Если HTML невозможно исправить, возвращает текст без HTML-тегов.
+    """
+    if not text or '<' not in text:
+        return text
+    
+    # Предварительная обработка для угловых скобок, не являющихся HTML-тегами
+    # Экранируем одиночные '<' и '>', которые не соответствуют HTML-тегам
+    processed_text = ""
+    i = 0
+    while i < len(text):
+        if text[i] == '<':
+            # Проверяем, является ли это началом валидного HTML-тега
+            tag_match = re.match(r'</?[a-zA-Z][a-zA-Z0-9]*(?:\s+[^>]*)?>|</[a-zA-Z][a-zA-Z0-9]*>', text[i:i+100])
+            if not tag_match:
+                # Это не HTML-тег, экранируем
+                processed_text += '&lt;'
+            else:
+                # Это похоже на HTML-тег, сохраняем
+                tag_content = tag_match.group(0)
+                processed_text += tag_content
+                i += len(tag_content) - 1  # -1 потому что i будет увеличен ниже
+        elif text[i] == '>':
+            # Проверяем, не является ли это частью тега
+            if i > 0 and text[i-1] != '>':
+                # Проверяем, не является ли это концом тега
+                prev_open_bracket = text[:i].rfind('<')
+                if prev_open_bracket == -1 or '>' in text[prev_open_bracket:i]:
+                    # Это не часть HTML-тега, экранируем
+                    processed_text += '&gt;'
+                else:
+                    processed_text += '>'
+            else:
+                processed_text += '>'
+        else:
+            processed_text += text[i]
+        i += 1
+    
+    text = processed_text
+    
+    # Список тегов для проверки
+    tags_to_check = ['b', 'i', 'u', 's', 'code', 'pre']
+    
+    # Проверяем баланс основных тегов
+    for tag in tags_to_check:
+        open_count = text.count(f'<{tag}>')
+        close_count = text.count(f'</{tag}>')
+        
+        # Если теги не сбалансированы, исправляем
+        if open_count > close_count:
+            # Добавляем закрывающие теги
+            text += f'</{tag}>' * (open_count - close_count)
+        elif close_count > open_count:
+            # Удаляем лишние закрывающие теги
+            pattern = f'</{tag}>'
+            excess = close_count - open_count
+            
+            for _ in range(excess):
+                pos = text.rfind(pattern)
+                if pos >= 0:
+                    text = text[:pos] + text[pos + len(pattern):]
+    
+    # Обработка незакрытых тегов (открытые, но не закрытые)
+    stack = []
+    result = []
+    i = 0
+    
+    while i < len(text):
+        if text[i:i+1] == '<':
+            if i + 1 < len(text) and text[i+1:i+2] == '/':
+                # Закрывающий тег
+                end = text.find('>', i)
+                if end == -1:
+                    # Незакрытая угловая скобка, экранируем
+                    result.append('&lt;/')
+                    i += 2
+                    continue
+                
+                tag_name = text[i+2:end].strip().lower()
+                if not stack or stack[-1] != tag_name:
+                    # Несбалансированный тег - пропускаем
+                    i = end + 1
+                    continue
+                
+                # Правильный закрывающий тег
+                stack.pop()
+                result.append(text[i:end+1])
+                i = end + 1
+            else:
+                # Открывающий тег
+                end = text.find('>', i)
+                if end == -1:
+                    # Незакрытая угловая скобка, экранируем
+                    result.append('&lt;')
+                    i += 1
+                    continue
+                
+                tag_content = text[i+1:end].strip().lower()
+                # Пропускаем самозакрывающиеся теги
+                if ' ' in tag_content or tag_content.endswith('/'):
+                    result.append(text[i:end+1])
+                    i = end + 1
+                    continue
+                
+                if tag_content in tags_to_check:
+                    stack.append(tag_content)
+                
+                result.append(text[i:end+1])
+                i = end + 1
+        else:
+            result.append(text[i])
+            i += 1
+    
+    # Закрываем все оставшиеся открытые теги
+    for tag in reversed(stack):
+        result.append(f'</{tag}>')
+    
+    # Проверяем валидность исправленного HTML
+    final_text = ''.join(result)
+    
+    # Финальная санитизация для Telegram
+    try:
+        final_text = sanitize_telegram_html(final_text)
+    except Exception as e:
+        logging.error(f"Ошибка при финальной санитизации HTML: {e}")
+    
+    if is_stream_html_valid(final_text):
+        return final_text
+    
+    # Если всё ещё не валидно, удаляем все HTML теги
+    return strip_html_tags(text)
 
 # Обработчик завершения работы
 # Исправляем сигнатуру, чтобы она принимала **kwargs, как передает aiogram
@@ -916,45 +1101,79 @@ async def clear_command_handler(message: types.Message):
         logging.error(f"Неожиданная ошибка при очистке истории: {e}")
         await message.answer("Произошла ошибка при очистке истории")
 
-# НОВЫЙ: Обработчик сообщений с фото (Обновлен: сообщает о неподдержке)
+def log_html_diagnostic(text: str, title: str = "HTML диагностика"):
+    """
+    Выполняет диагностику HTML и логирует информацию о проблемах конструкциях
+    """
+    if not text or ('<' not in text and '>' not in text):
+        return
+        
+    # Общие подсчеты
+    left_brackets = text.count('<')
+    right_brackets = text.count('>')
+    bracket_diff = left_brackets - right_brackets
+    
+    logging.debug(f"{title}: Баланс угловых скобок: {left_brackets} '<' vs {right_brackets} '>', разница: {bracket_diff}")
+    
+    # Проверка незавершенных тегов
+    if bracket_diff != 0:
+        # Проверяем наличие неполных тегов
+        partial_tags = re.findall(r'<([a-z0-9]+)(?![^<>]*>)', text, flags=re.IGNORECASE)
+        if partial_tags:
+            logging.debug(f"{title}: Найдены незавершенные теги: {', '.join(partial_tags)}")
+        
+        # Проверяем наличие незакрытых тегов в конце текста
+        if text.rstrip().endswith('<'):
+            logging.debug(f"{title}: Текст заканчивается открытой угловой скобкой '<'")
+    
+    # Проверяем баланс основных тегов
+    supported_tags = ['b', 'i', 'u', 's', 'code', 'pre', 'a', 'tg-spoiler']
+    for tag in supported_tags:
+        open_pattern = re.compile(f'<{tag}(?:\\s+[^>]*)?>', re.IGNORECASE)
+        open_tags = open_pattern.findall(text)
+        open_count = len(open_tags)
+        
+        close_pattern = re.compile(f'</{tag}>', re.IGNORECASE)
+        close_tags = close_pattern.findall(text)
+        close_count = len(close_tags)
+        
+        if open_count != close_count:
+            logging.debug(f"{title}: Дисбаланс тега '{tag}': {open_count} открыт., {close_count} закрыт., разница: {open_count - close_count}")
+            
+            # Дополнительно логируем позиции проблемных тегов
+            if open_count > 0 or close_count > 0:
+                # Находим позиции всех тегов
+                open_positions = [m.start() for m in open_pattern.finditer(text)]
+                close_positions = [m.start() for m in close_pattern.finditer(text)]
+                
+                logging.debug(f"{title}: Позиции открывающих тегов '{tag}': {open_positions}")
+                logging.debug(f"{title}: Позиции закрывающих тегов '{tag}': {close_positions}")
+
+# И обновляем обработчик фото, чтобы форматирование применялось только к финальному ответу
 @dp.message(F.photo)
 async def photo_handler(message: types.Message, bot: Bot):
     """Обрабатывает сообщения с фотографиями."""
     user_id = message.from_user.id
-    photo = message.photo[-1]
-    file_id = photo.file_id
-    caption = message.caption # Получаем подпись к фото
-
-    logger.info(f"Получено фото от user_id={user_id} (file_id: {file_id}). Подпись: {caption}")
-
-    await message.reply(
-        "Получил фото. К сожалению, текущая конфигурация API DeepSeek не поддерживает анализ изображений через этот endpoint. "
-        "Если вы добавили подпись к фото, я обработаю ее как обычный текст."
-    )
-
-    # Если есть подпись, обрабатываем ее как обычное текстовое сообщение
+    file_id = message.photo[-1].file_id  # Берем самое большое разрешение
+    caption = message.caption or ""
+    
+    # Получаем зависимости
+    db = dp.workflow_data.get('db')
+    settings_local = dp.workflow_data.get('settings')
+    
+    if not db or not settings_local:
+        logging.error("Не удалось получить БД или настройки при обработке фото")
+        await message.reply("Произошла внутренняя ошибка, попробуйте позже")
+        return
+    
+    # Если есть подпись к фото, обрабатываем её как текстовый запрос
     if caption:
-        logger.info(f"Обработка подписи к фото как текста для user_id={user_id}")
-        # Создаем новое "виртуальное" сообщение с текстом из подписи
-        # и передаем его в обычный message_handler
-        # Важно: message_handler ожидает объект message, создадим аналог
-        # с необходимыми полями или вызовем его логику напрямую.
-        # Простой вариант: вызвать основную логику обработки текста.
-
-        # Получаем зависимости (аналогично message_handler)
-        db = dp.workflow_data.get('db')
-        settings_local = dp.workflow_data.get('settings') # Используем другое имя, чтобы не конфликтовать с глобальным settings
-
-        if not db or not settings_local:
-            logging.error("Не удалось получить зависимости для обработки подписи к фото")
-            await message.reply("Произошла внутренняя ошибка при попытке обработать подпись к фото.")
-            return
-
-        await message.bot.send_chat_action(chat_id=user_id, action="typing")
-
         try:
-            # Сохраняем подпись как сообщение пользователя
-            await add_message_to_db(db, user_id, "user", caption)
+            await message.bot.send_chat_action(chat_id=user_id, action="typing")
+            
+            # Сохраняем сообщение пользователя с подписью
+            caption_with_photo = f"[Фото] {caption}"
+            await add_message_to_db(db, user_id, "user", caption_with_photo)
             logging.info(f"Подпись к фото от пользователя {user_id} сохранена")
 
             # Получаем историю сообщений (включая только что добавленную подпись)
@@ -965,67 +1184,21 @@ async def photo_handler(message: types.Message, bot: Bot):
             response_text = await get_deepseek_response(settings_local.DEEPSEEK_API_KEY, SYSTEM_PROMPT, history)
 
             if response_text:
-                cleaned_response_text = await clean_html_for_telegram(response_text)
-                await add_message_to_db(db, user_id, "assistant", response_text) # Сохраняем оригинал
-                logging.info(f"Ответ ассистента (на подпись) для пользователя {user_id} сохранен")
-
-                # Отправляем ответ (как в message_handler)
-                if len(cleaned_response_text) > TELEGRAM_MAX_LENGTH:
-                    # ... (логика разделения на части, как в message_handler)
-                    logging.info(f"Очищенный ответ (на подпись) слишком длинный ({len(cleaned_response_text)} символов), разделяю на части.")
-                    parts = []
-                    current_part = ""
-                    for paragraph in cleaned_response_text.split('\n\n'):
-                        if len(current_part) + len(paragraph) + 2 <= TELEGRAM_MAX_LENGTH:
-                            current_part += paragraph + "\n\n"
-                        else:
-                            if len(paragraph) > TELEGRAM_MAX_LENGTH:
-                                if current_part.strip():
-                                    parts.append(current_part.strip())
-                                current_part = ""
-                                for i in range(0, len(paragraph), TELEGRAM_MAX_LENGTH):
-                                    parts.append(paragraph[i:i + TELEGRAM_MAX_LENGTH])
-                            else:
-                                if current_part.strip():
-                                    parts.append(current_part.strip())
-                                current_part = paragraph + "\n\n"
-                    if current_part.strip():
-                        parts.append(current_part.strip())
-                    for i, part in enumerate(parts):
-                        logging.info(f"Отправка очищенной части {i+1}/{len(parts)} (на подпись) пользователю {user_id}")
-                        try:
-                            await message.answer(part, parse_mode='HTML') # Отвечаем на исходное сообщение с фото
-                            await asyncio.sleep(0.5)
-                        except Exception as send_error:
-                            logging.error(f"Ошибка отправки части {i+1} (на подпись): {send_error}")
-                            await message.answer(f"Ошибка при отправке части {i+1} ответа на подпись.")
-                            break
-                else:
-                    await message.answer(cleaned_response_text, parse_mode='HTML') # Отвечаем на исходное сообщение с фото
+                # Сохраняем ответ в БД и отправляем без форматирования
+                await add_message_to_db(db, user_id, "assistant", response_text)
+                logging.info(f"Ответ ассистента сохранен")
+                await message.answer(response_text)
+                return
             else:
-                logging.warning(f"Не удалось получить ответ от DeepSeek API на подпись к фото для пользователя {user_id}")
+                logging.warning(f"Не удалось получить ответ от DeepSeek API для пользователя {user_id}")
                 await message.reply("Извините, произошла ошибка при обработке вашей подписи к фото.")
 
         except Exception as e:
             logging.exception(f"Ошибка при обработке подписи к фото для user_id={user_id}: {e}")
             await message.reply("Произошла ошибка при обработке подписи к фото.")
-
-    # --- Логика скачивания и обработки base64 УДАЛЕНА --- 
-    # try:
-    #     # Скачиваем фото в память
-    #     file_info = await bot.get_file(file_id)
-    #     ...
-    #     image_base64 = base64.b64encode(file_content.read()).decode('utf-8')
-    #     ...
-    #     # Отправляем запрос в DeepSeek с изображением
-    #     response_text = await get_deepseek_response(
-    #         ...
-    #         image_data=image_base64 # Передаем base64 изображения
-    #     )
-    #     ...
-    # except Exception as e:
-    #     ...
-    # ----------------------------------------------------
+    else:
+        # Если подписи нет, просто сообщаем что получили фото
+        await message.reply("Я получил ваше фото. Чтобы получить ответ от ассистента, пожалуйста, добавьте подпись с вопросом или описанием.")
 
 # НОВЫЙ: Обработчик сообщений с документами
 @dp.message(F.document)
@@ -1120,10 +1293,8 @@ def is_valid_html(html_text: str) -> bool:
             logging.warning("Несбалансированные угловые скобки в HTML")
             return False
             
-        # Проверка на экранированные теги, которые могли остаться
-        if '&lt;' in html_text or '&gt;' in html_text:
-            logging.warning("Найдены экранированные HTML-теги")
-            return False
+        # В отличие от предыдущей версии, НЕ считаем экранированные теги ошибкой
+        # Убираем проверку на &lt; и &gt;
             
         # Проверка на вложенные теги
         stack = []
@@ -1153,6 +1324,256 @@ def is_valid_html(html_text: str) -> bool:
         logging.error(f"Ошибка при проверке HTML: {e}")
         return False
 
+def sanitize_telegram_html(text: str) -> str:
+    """
+    Финальная подготовка HTML для отправки в Telegram API.
+    Удаляет или исправляет конструкции, которые могут вызвать ошибки.
+    """
+    if not text:
+        return ""
+        
+    # Проверка на наличие HTML тегов
+    if '<' not in text and '>' not in text:
+        return text
+        
+    # Известные проблемные паттерны, которые нужно заменить
+    replacements = [
+        # Синтаксис языков программирования
+        (r'<([a-z0-9_-]+)>\s*=', r'&lt;\1&gt; ='),  # Заменяем <variable> = value
+        (r'(\s|^|[^\w])<([a-z0-9_-]+)>', r'\1&lt;\2&gt;'),  # Экранируем <переменные> в тексте
+        (r'(\s|^)(<|>|<=|>=)(\s|$)', lambda m: m.group(1) + ('&lt;' if m.group(2)[0] == '<' else '&gt;') + m.group(3)),  # Операторы сравнения
+        
+        # Математические выражения
+        (r'(\d+)\s*<\s*(\d+)', r'\1 &lt; \2'),  # Числовые сравнения 5 < 10
+        (r'(\d+)\s*>\s*(\d+)', r'\1 &gt; \2'),  # Числовые сравнения 10 > 5
+        
+        # HTML-комментарии
+        (r'<!--.*?-->', ''),  # Удаляем HTML комментарии
+        
+        # URL-подобные строки с параметрами
+        (r'(https?://[^\s<]+)[?&][^=]+=([^&\s<>]+)(&[^=]+=([^&\s<>]+))*', lambda m: m.group(0).replace('&', '&amp;')),
+
+        # Вложенные теги одного типа (например <b><b>text</b></b>)
+        (r'<([bius])>(\s*)<\1>(.*?)</\1>(\s*)</\1>', r'<\1>\2\3\4</\1>'),
+        
+        # Специальные случаи для Telegram
+        (r'<(\w+)[^>]*\s+class="[^"]*"[^>]*>', r'<\1>'),  # Удаляем атрибуты class
+        (r'<(\w+)[^>]*\s+style="[^"]*"[^>]*>', r'<\1>'),  # Удаляем атрибуты style
+        
+        # Экранирование символов в коде
+        (r'<code>(.*?)</code>', lambda m: f'<code>{_escape_code_content(m.group(1))}</code>'),
+        (r'<pre>(.*?)</pre>', lambda m: f'<pre>{_escape_code_content(m.group(1))}</pre>'),
+        
+        # Экранирование одиночных угловых скобок, которые не являются частью HTML-тегов
+        (r'<(?![a-zA-Z/])', r'&lt;'),  # Экранируем < если за ним не идет буква или /
+        (r'(?<![a-zA-Z/"\'\s])>', r'&gt;'),  # Экранируем > если перед ним не буква, /, кавычка или пробел
+    ]
+    
+    # Применяем замены
+    result = text
+    for pattern, replacement in replacements:
+        result = re.sub(pattern, replacement, result, flags=re.IGNORECASE)
+
+    # Проверка на несбалансированные угловые скобки
+    if result.count('<') != result.count('>'):
+        # Находим и экранируем все одиночные < и >
+        processed = []
+        stack_count = 0
+        
+        for char in result:
+            if char == '<':
+                stack_count += 1
+                processed.append(char)
+            elif char == '>':
+                stack_count -= 1
+                processed.append(char)
+                
+                # Если стек стал отрицательным, у нас есть лишний >
+                if stack_count < 0:
+                    # Заменяем последний добавленный > на &gt;
+                    processed[-1] = '&gt;'
+                    stack_count = 0
+            else:
+                processed.append(char)
+        
+        # Если остались незакрытые <, заменяем их на &lt;
+        if stack_count > 0:
+            processed_text = ''.join(processed)
+            last_open_pos = processed_text.rfind('<')
+            
+            # Если это незакрытый тег в конце, экранируем его
+            if last_open_pos >= 0 and '>' not in processed_text[last_open_pos:]:
+                processed[-len(processed_text) + last_open_pos] = '&lt;'
+        
+        result = ''.join(processed)
+    
+    # Проверяем разрешенные теги Telegram
+    allowed_tags = ['b', 'i', 'u', 's', 'code', 'pre', 'a', 'tg-spoiler']
+    
+    # Удаляем все теги, которые не поддерживаются Telegram
+    tags_pattern = re.compile(r'</?([a-z0-9-]+)(?:\s+[^>]*)?>', re.IGNORECASE)
+    
+    def replace_tag(match):
+        tag = match.group(1).lower()
+        full_tag = match.group(0)
+        
+        # Если тег a, проверяем корректность атрибута href
+        if tag == 'a' and 'href=' in full_tag:
+            # Если атрибут href корректен, оставляем тег
+            href_match = re.search(r'href=[\'"](https?://[^\'"]+)[\'"]', full_tag)
+            if href_match:
+                # Корректный URL, возвращаем тег как есть
+                return full_tag
+        
+        # Если тег в списке разрешенных и это не <a> с атрибутами или это </a>, оставляем его
+        if tag in allowed_tags and (tag != 'a' or not 'href=' in full_tag or full_tag.startswith('</a')):
+            return full_tag
+            
+        # Иначе экранируем
+        return f'&lt;{tag}&gt;'
+    
+    # Применяем правила фильтрации тегов
+    result = tags_pattern.sub(replace_tag, result)
+    
+    return result
+
+# Вспомогательная функция для экранирования содержимого кода
+def _escape_code_content(text: str) -> str:
+    """Экранирует HTML внутри тегов code и pre."""
+    # Заменяем < и > на их экранированные версии, но только если они не являются
+    # частью тегов, которые уже экранированы (например, &lt; и &gt;)
+    text = re.sub(r'<(?!/?(?:b|i|u|s|code|pre|a)>)', r'&lt;', text)
+    text = re.sub(r'(?<!</?(?:b|i|u|s|code|pre|a))>', r'&gt;', text)
+    return text
+
+# И обновим safe_send_html_message, чтобы использовать эту функцию перед отправкой
+async def safe_send_html_message(bot, chat_id, message_id, text, is_edit=True):
+    """
+    Безопасно отправляет или редактирует сообщение с HTML-форматированием.
+    Проверяет и исправляет HTML перед отправкой, используя подробную диагностику.
+    """
+    original_text = text
+    
+    # Применяем диагностику перед любыми изменениями
+    log_html_diagnostic(text, "Исходный HTML перед отправкой")
+    
+    # Проверяем валидность HTML и исправляем при необходимости
+    if not is_valid_html(text):
+        logging.warning("HTML невалиден перед отправкой в Telegram, пробуем исправить")
+        text = fix_streaming_html(text)
+
+        # Повторная диагностика после первой попытки исправления
+        log_html_diagnostic(text, "HTML после первого исправления")
+        
+        if not is_valid_html(text):
+            logging.warning("HTML все еще невалиден, пробуем более агрессивное исправление")
+            
+            # Повторное исправление с другими параметрами
+            text = fix_streaming_html(text)
+            log_html_diagnostic(text, "HTML после второго исправления")
+            
+            if not is_valid_html(text):
+                logging.warning("HTML все еще невалиден, отправляем без форматирования")
+                text = strip_html_tags(original_text)
+                parse_mode = None  # Без форматирования
+            else:
+                # Финальная санитизация HTML
+                text = sanitize_telegram_html(text)
+                parse_mode = 'HTML'
+        else:
+            # Финальная санитизация HTML
+            text = sanitize_telegram_html(text)
+            parse_mode = 'HTML'
+    else:
+        # Финальная санитизация HTML даже для валидного HTML
+        text = sanitize_telegram_html(text)
+        parse_mode = 'HTML'
+    
+    try:
+        # Отправляем или редактируем сообщение
+        if is_edit and message_id:
+            return await bot.edit_message_text(
+                text=text,
+                chat_id=chat_id,
+                message_id=message_id,
+                parse_mode=parse_mode
+            )
+        else:
+            return await bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                parse_mode=parse_mode
+            )
+    except TelegramAPIError as e:
+        logging.error(f"Ошибка при отправке HTML: {e}")
+        
+        # Подробная диагностика ошибки
+        error_text = str(e)
+        if "can't parse entities" in error_text.lower():
+            # Пытаемся найти позицию проблемного тега из сообщения об ошибке
+            position_match = re.search(r'position (\d+)', error_text)
+            if position_match:
+                position = int(position_match.group(1))
+                logging.error(f"Проблемная позиция в HTML: {position}")
+                # Логируем окружение проблемного места
+                context_start = max(0, position - 20)
+                context_end = min(len(text), position + 20)
+                context = text[context_start:context_end]
+                logging.error(f"Контекст ошибки: ...{context}...")
+        
+        # Пробуем отправить без HTML
+        try:
+            stripped_text = strip_html_tags(original_text)
+            if is_edit and message_id:
+                return await bot.edit_message_text(
+                    text=stripped_text,
+                    chat_id=chat_id,
+                    message_id=message_id
+                )
+            else:
+                return await bot.send_message(
+                    chat_id=chat_id,
+                    text=stripped_text
+                )
+        except TelegramAPIError as plain_error:
+            logging.error(f"Ошибка при отправке без форматирования: {plain_error}")
+            return None
+
 # Запуск бота
 if __name__ == "__main__":
     asyncio.run(main())
+
+# Новая функция для преобразования текста модели в Telegram Markdown
+async def apply_stream_markdown(text: str) -> str:
+    import re
+    # Удаляем HTML-теги
+    text = re.sub(r'<[^>]+>', '', text)
+    # Кодовые блоки
+    code_blocks = []
+    def repl_block(m):
+        code_blocks.append(m.group(1))
+        return f"<<<BLOCK{len(code_blocks)-1}>>>"
+    text = re.sub(r'```([\s\S]+?)```', repl_block, text)
+    # Встроенный (inline) код
+    inline_codes = []
+    def repl_inline(m):
+        inline_codes.append(m.group(1))
+        return f"<<<INLINE{len(inline_codes)-1}>>>"
+    text = re.sub(r'`([^`\n]+?)`', repl_inline, text)
+    # Заголовки # до ######
+    def repl_header(m):
+        return f"__**{m.group(2).strip()}**__"
+    text = re.sub(r'^(#{1,6})\s+(.+)$', repl_header, text, flags=re.MULTILINE)
+    # Жирный **text**
+    text = re.sub(r'\*\*(.+?)\*\*', r'**\1**', text)
+    # Курсив __text__ или *text* или _text_
+    text = re.sub(r'__(.+?)__', r'__\1__', text)
+    text = re.sub(r'\*(.+?)\*', r'__\1__', text)
+    text = re.sub(r'_(.+?)_', r'__\1__', text)
+    # Восстановление inline-кода
+    for i, code in enumerate(inline_codes):
+        text = text.replace(f'<<<INLINE{i}>>>', f'`{code}`')
+    # Восстановление блоков кода
+    for i, code in enumerate(code_blocks):
+        text = text.replace(f'<<<BLOCK{i}>>>', f'```{code}```')
+    return text
