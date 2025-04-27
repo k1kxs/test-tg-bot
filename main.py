@@ -383,44 +383,62 @@ def markdown_to_telegram_html(text: str) -> str:
     """
     Преобразует базовый Markdown в HTML, поддерживаемый Telegram.
     Экранирует специальные символы HTML.
+    Обрабатывает блоки кода, inline код и LaTeX-подобные математические выражения.
+    Использует безопасные плейсхолдеры, чтобы избежать конфликтов с Markdown.
     """
     if not text:
         return ""
 
-    # 1. Экранирование базовых HTML символов ВЕЗДЕ, КРОМЕ содержимого тегов code/pre
+    # 1. Экранирование базовых HTML символов ВЕЗДЕ
     text = html.escape(text)
 
-    # 2. Обработка блоков кода ``` ``` -> <pre>...</pre>
-    # Сначала обрабатываем блоки, чтобы их содержимое не трогать дальше
+    # Плейсхолдеры для замены
     code_blocks = []
-    def _replace_code_block(match):
-        lang = match.group(1) or "" # Язык может быть пустым
-        code = match.group(2)
-        # Внутри <pre> оставляем экранированный HTML (html.escape уже сделал это)
-        # Если нужно указать язык (Telegram поддерживает class="language-python" внутри <pre>):
-        # pre_tag = f'<pre><code class="language-{html.escape(lang.lower())}">' if lang else '<pre><code>'
-        # Пока делаем проще:
-        pre_tag = '<pre>'
-        code_blocks.append(f"{pre_tag}{code}</pre>") # html.escape УЖЕ применен к code
-        return f"__CODE_BLOCK_{len(code_blocks)-1}__"
+    inline_codes = []
+    math_codes = []
 
-    # Паттерн для блоков кода (включая необязательный язык)
+    # 2. Обработка блоков кода ``` ``` -> <pre>...</pre>
+    def _replace_code_block(match):
+        lang = match.group(1) or ""
+        code = match.group(2)
+        pre_tag = '<pre>'
+        placeholder = f"@@CODEBLOCK_{len(code_blocks)}@@"
+        code_blocks.append((placeholder, f"{pre_tag}{code}</pre>"))
+        return placeholder
     text = re.sub(r"```(\w*)\n?(.*?)\n?```", _replace_code_block, text, flags=re.DOTALL | re.MULTILINE)
 
     # 3. Обработка inline кода ` ` -> <code>...</code>
-    inline_codes = []
     def _replace_inline_code(match):
         code = match.group(1)
-        # Внутри <code> оставляем экранированный HTML
-        inline_codes.append(f"<code>{code}</code>") # html.escape УЖЕ применен к code
-        return f"__INLINE_CODE_{len(inline_codes)-1}__"
+        placeholder = f"@@INLINECODE_{len(inline_codes)}@@"
+        inline_codes.append((placeholder, f"<code>{code}</code>"))
+        return placeholder
     text = re.sub(r"`(.+?)`", _replace_inline_code, text)
+
+    # 3.5 Обработка LaTeX math \\[ ... \\] и \\( ... \\) -> <code>...</code>
+    def _replace_math_code(match):
+        math_content = match.group(1)
+
+        # Преобразуем базовые LaTeX команды в псевдо-текст
+        # Сначала \text{...}
+        math_content = re.sub(r"\\text{(.*?)}", r"\1", math_content)
+        # Затем \frac{...}{...}
+        math_content = re.sub(r"\\frac{(.*?)}{(.*?)}", r"(\1 / \2)", math_content)
+        # Затем \,
+        math_content = math_content.replace(r",", " ")
+
+        placeholder = f"@@MATH_{len(math_codes)}@@"
+        # Оборачиваем ПРЕОБРАЗОВАННОЕ содержимое в <code>
+        math_codes.append((placeholder, f"<code>{math_content}</code>"))
+        return placeholder
+    # Сначала блочные \\[ ... \\], затем инлайновые \\( ... \\)
+    text = re.sub(r"\\\[(.*?)\\]", _replace_math_code, text, flags=re.DOTALL)
+    text = re.sub(r"\\((.*?)\\)", _replace_math_code, text)
 
     # 4. Обработка жирного текста **text** -> <b>text</b>
     text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
-    # Обработка жирного текста __text__ -> <b>text</b> (если используется)
+    # Обработка жирного текста __text__ -> <b>text</b> (ПОСЛЕ замены плейсхолдеров)
     text = re.sub(r"__(.+?)__", r"<b>\1</b>", text)
-
 
     # 5. Обработка курсива *text* -> <i>text</i> (после жирного)
     text = re.sub(r"\*(.+?)\*", r"<i>\1</i>", text)
@@ -431,32 +449,25 @@ def markdown_to_telegram_html(text: str) -> str:
     text = re.sub(r"~~(.+?)~~", r"<s>\1</s>", text)
 
     # 7. Обработка заголовков #### text -> <b>text</b> (простой вариант)
-    # Заменяем Markdown заголовки на жирный текст
     text = re.sub(r"^\s*#{1,6}\s+(.+)$", r"<b>\1</b>", text, flags=re.MULTILINE)
 
     # 8. Обработка ссылок [text](url) -> <a href="url">text</a>
-    # Важно: URL внутри href НЕ должен быть html.escape'нут, а текст ссылки - должен
     def _replace_link(match):
-        link_text = match.group(1) # Текст уже экранирован
+        link_text = match.group(1)
         url = match.group(2)
-        # Убираем экранирование из URL, если оно там случайно появилось
         url_unescaped = html.unescape(url)
-        # Дополнительно экранируем кавычки внутри URL для безопасности
         safe_url = url_unescaped.replace('"', '%22').replace("'", '%27')
         return f'<a href="{safe_url}">{link_text}</a>'
     text = re.sub(r"\[(.+?)\]\((.+?)\)", _replace_link, text)
 
-    # 9. Восстановление inline кода
-    for i, code in enumerate(inline_codes):
-        text = text.replace(f"__INLINE_CODE_{i}__", code)
-
-    # 10. Восстановление блоков кода
-    for i, code_block in enumerate(code_blocks):
-        text = text.replace(f"__CODE_BLOCK_{i}__", code_block)
-
-    # 11. Замена экранированных переносов строк на <br> (опционально, обычно не нужно)
-    # text = text.replace("&#10;", "\n") # Вернем обычные переносы строк
-    # text = text.replace("\n", "<br/>") # Если нужны <br>
+    # 9-11. Восстановление блоков в обратном порядке (чтобы индексы не сбивались, если плейсхолдеры вложены)
+    # Сначала самые внутренние (math, inline), потом внешние (code blocks)
+    for placeholder, replacement in reversed(math_codes):
+        text = text.replace(placeholder, replacement)
+    for placeholder, replacement in reversed(inline_codes):
+        text = text.replace(placeholder, replacement)
+    for placeholder, replacement in reversed(code_blocks):
+        text = text.replace(placeholder, replacement)
 
     return text.strip()
 
