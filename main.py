@@ -511,7 +511,7 @@ async def stream_xai_response(api_key: str, system_prompt: str, history: list[di
         "model": "grok-3-mini-beta",
         "messages": messages,
         "stream": True,
-        "temperature": 0.4,
+        "temperature": 0.7,
         "reasoning": {"effort": "high"},
     }
     # Таймаут для запроса (в секундах)
