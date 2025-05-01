@@ -1527,6 +1527,8 @@ async def set_bot_commands(bot_instance: Bot):
         types.BotCommand(command="/stats", description="Показать статистику бота"),
         types.BotCommand(command="/find_user", description="Поиск пользователя по ID или username"),
         types.BotCommand(command="/list_subs", description="Список пользователей по подписке"),
+        types.BotCommand(command="/grant_admin", description="Выдать права администратора"),
+        types.BotCommand(command="/grant_sub", description="Выдать подписку на 7 или 30 дней"),
         types.BotCommand(command="/send_to_user", description="Отправить сообщение конкретному пользователю"),
         types.BotCommand(command="/broadcast", description="Рассылка сообщения всем пользователям"),
     ]
@@ -1730,6 +1732,7 @@ ADMIN_COMMANDS_LIST = [
     ("/find_user", "`<id_or_username>` - Найти пользователя по ID или @username."),
     ("/list_subs", "`[active|expired]` - Показать список пользователей с подписками (по умолчанию 'active', можно указать 'expired')."),
     ("/grant_admin", "Выдать права администратора другому пользователю."),
+    ("/grant_sub", "`<user_id> <7|30>` - Выдать подписку пользователю на указанное количество дней."),
     ("/send_to_user", "`<user_id> <text>` - Отправить сообщение пользователю от имени бота."),
     ("/broadcast", "`<text>` - **ОСТОРОЖНО!** Отправить сообщение всем пользователям бота (может занять время)."),
 ]
@@ -1790,6 +1793,28 @@ async def grant_admin_handler(message: types.Message):
     # Обновляем права администратора
     await update_user_admin(db, target_id, True)
     await message.reply(f"✅ Пользователь {target_id} теперь администратор.")
+
+@dp.message(Command("grant_sub"), IsAdmin())
+async def grant_sub_handler(message: types.Message):
+    """Выдаёт подписку пользователю на 7 или 30 дней."""
+    db = dp.workflow_data.get('db')
+    parts = message.text.strip().split(maxsplit=2)
+    if len(parts) != 3:
+        return await message.reply("Использование: /grant_sub <user_id> <days>")
+    try:
+        target_id = int(parts[1])
+        days = int(parts[2])
+    except ValueError:
+        return await message.reply("Неверный формат, нужно: /grant_sub <user_id> <days>")
+    if days not in (7, 30):
+        return await message.reply("Можно выдать подписку только на 7 или 30 дней.")
+    target = await get_user(db, target_id)
+    if not target:
+        return await message.reply(f"Пользователь {target_id} не найден.")
+    await update_user_subscription(db, target_id, days)
+    new_data = await get_user(db, target_id)
+    expires = new_data.get('subscription_expires')
+    await message.reply(f"✅ Подписка выдана пользователю {target_id} на {days} дней (до {expires}).")
 
 @dp.message(Command("broadcast"), IsAdmin())
 async def broadcast_handler(message: types.Message, command: CommandObject):
@@ -2388,6 +2413,8 @@ async def set_bot_commands(bot_instance: Bot):
         types.BotCommand(command="/stats", description="Показать статистику бота"),
         types.BotCommand(command="/find_user", description="Поиск пользователя по ID или username"),
         types.BotCommand(command="/list_subs", description="Список пользователей по подписке"),
+        types.BotCommand(command="/grant_admin", description="Выдать права администратора"),
+        types.BotCommand(command="/grant_sub", description="Выдать подписку на 7 или 30 дней"),
         types.BotCommand(command="/send_to_user", description="Отправить сообщение конкретному пользователю"),
         types.BotCommand(command="/broadcast", description="Рассылка сообщения всем пользователям"),
     ]
@@ -2502,6 +2529,27 @@ async def update_user_admin(db, target_user_id: int, make_admin: bool):
             await conn.execute(
                 "UPDATE users SET is_admin = $1 WHERE user_id = $2",
                 make_admin, target_user_id
+            )
+
+# --- Функция для выдачи подписки пользователю на указанное количество дней ---
+async def update_user_subscription(db, target_user_id: int, days: int):
+    """Активирует подписку пользователя на days дней."""
+    if settings.USE_SQLITE:
+        def _upd():
+            conn = sqlite3.connect(db)
+            cur = conn.cursor()
+            cur.execute(
+                "UPDATE users SET subscription_status='active', subscription_expires=date('now', '+' || ? || ' days') WHERE user_id = ?",
+                (days, target_user_id)
+            )
+            conn.commit()
+            conn.close()
+        await asyncio.to_thread(_upd)
+    else:
+        async with db.acquire() as conn:
+            await conn.execute(
+                "UPDATE users SET subscription_status='active', subscription_expires = NOW() + $1 * INTERVAL '1 day' WHERE user_id = $2",
+                days, target_user_id
             )
 
 # Запускаем бота
