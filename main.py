@@ -1257,10 +1257,167 @@ async def photo_handler(message: types.Message):
 @dp.message(F.document)
 async def document_handler(message: types.Message):
     user_id = message.from_user.id
+    # Получаем зависимости
+    db = dp.workflow_data.get('db')
+    current_settings = dp.workflow_data.get('settings')
+    if not db or not current_settings:
+        logger.error("Не удалось получить соединение с БД или настройки при обработке документа")
+        await message.answer("Внутренняя ошибка при обработке документа.", reply_markup=None)
+        return
+
     file_name = message.document.file_name or "Без имени"
-    mime_type = message.document.mime_type or "Неизвестный тип"
-    logger.info(f"Получен документ от user_id={user_id}: {file_name} (type: {mime_type})")
-    await message.reply(f"Получил документ '{file_name}'. Обработка документов пока не реализована.")
+    ext = os.path.splitext(file_name)[1].lower()
+    bio = io.BytesIO()
+    # Скачиваем документ
+    await bot.download(message.document, destination=bio)
+    bio.seek(0)
+
+    # Извлечение текста из документа
+    try:
+        if ext == ".pdf":
+            import PyPDF2
+            reader = PyPDF2.PdfReader(bio)
+            text = "".join(page.extract_text() or "" for page in reader.pages)
+        elif ext == ".docx":
+            from docx import Document as DocxDocument
+            docx = DocxDocument(bio)
+            text = "\n".join(para.text for para in docx.paragraphs)
+        else:
+            await message.reply(f"Неподдерживаемый формат документа: {ext}", reply_markup=main_menu_keyboard())
+            return
+    except Exception as e:
+        logger.exception(f"Ошибка извлечения текста из документа: {e}")
+        await message.reply("Не удалось извлечь текст из документа.", reply_markup=main_menu_keyboard())
+        return
+
+    # Формируем запрос для модели
+    prompt = f"Прочитай следующий документ {file_name} и дай краткое содержание:\n{text}"
+    await add_message_to_db(db, user_id, "user", prompt)
+    history = await get_last_messages(db, user_id, limit=CONVERSATION_HISTORY_LIMIT)
+
+    # --- Новая логика стриминга с авто-разбиением (как в обычном сообщении) ---
+    chat_id = message.chat.id
+    full_raw_response = ""
+    current_message_text = ""
+    current_message_id = None
+    message_count = 0
+    last_edit_time = 0
+    edit_interval = 1.5
+    formatting_failed = False
+
+    # Отправка первого плейсхолдера
+    try:
+        placeholder_msg = await message.answer("⏳", reply_markup=progress_keyboard(user_id))
+        current_message_id = placeholder_msg.message_id
+        message_count = 1
+        last_edit_time = time.monotonic()
+    except TelegramAPIError as e:
+        logger.error(f"Ошибка отправки плейсхолдера для документа: {e}")
+        await message.reply("Не удалось начать стриминг ответа.", reply_markup=main_menu_keyboard())
+        return
+
+    # Читаем стрим от модели
+    async for chunk in stream_xai_response(current_settings.XAI_API_KEY, SYSTEM_PROMPT, history):
+        if not current_message_id:
+            break
+        full_raw_response += chunk
+        now = time.monotonic()
+
+        tentative = current_message_text + chunk
+        try:
+            html_check = markdown_to_telegram_html(tentative) + "..."
+            fmt_err = False
+        except Exception:
+            html_check = tentative + "..."
+            fmt_err = True
+            formatting_failed = True
+
+        # Проверяем, не надо ли начать новое сообщение
+        if len(html_check) > TELEGRAM_MAX_LENGTH:
+            # Финализируем текущее
+            try:
+                part_html = (markdown_to_telegram_html(current_message_text)
+                             if not formatting_failed else current_message_text)
+                if part_html:
+                    await bot.edit_message_text(
+                        text=part_html,
+                        chat_id=chat_id,
+                        message_id=current_message_id,
+                        parse_mode=None if formatting_failed else ParseMode.HTML,
+                        reply_markup=progress_keyboard(user_id)
+                    )
+            except TelegramAPIError as e:
+                logger.error(f"Ошибка финализации части {message_count}: {e}")
+
+            # Новый placeholder
+            current_message_text = chunk
+            message_count += 1
+            try:
+                await bot.edit_message_reply_markup(chat_id=chat_id,
+                                                   message_id=current_message_id,
+                                                   reply_markup=None)
+                placeholder_msg = await message.answer("...", reply_markup=progress_keyboard(user_id))
+                current_message_id = placeholder_msg.message_id
+                last_edit_time = time.monotonic()
+            except TelegramAPIError as e:
+                logger.error(f"Ошибка отправки нового плейсхолдера части {message_count}: {e}")
+                current_message_id = None
+                break
+        else:
+            current_message_text += chunk
+            # Троттлинг редактирования
+            if now - last_edit_time > edit_interval:
+                try:
+                    html_send = (markdown_to_telegram_html(current_message_text)
+                                 if not formatting_failed else current_message_text)
+                    text_preview = html_send + "..."
+                    await bot.edit_message_text(
+                        text=text_preview,
+                        chat_id=chat_id,
+                        message_id=current_message_id,
+                        parse_mode=None if formatting_failed else ParseMode.HTML,
+                        reply_markup=progress_keyboard(user_id)
+                    )
+                    last_edit_time = now
+                except TelegramRetryAfter as e:
+                    await asyncio.sleep(e.retry_after + 0.1)
+                    last_edit_time = time.monotonic()
+                except TelegramAPIError as e:
+                    logger.error(f"Ошибка редактирования части {message_count}: {e}")
+
+    # Финализация последнего сообщения
+    if current_message_id and current_message_text:
+        try:
+            final_html = (markdown_to_telegram_html(current_message_text)
+                          if not formatting_failed else current_message_text)
+            await bot.edit_message_text(
+                text=final_html,
+                chat_id=chat_id,
+                message_id=current_message_id,
+                parse_mode=None if formatting_failed else ParseMode.HTML,
+                reply_markup=None
+            )
+            await message.answer("🫡", reply_markup=main_menu_keyboard())
+        except TelegramAPIError as e:
+            logger.error(f"Ошибка финализации последнего сообщения: {e}")
+    elif not full_raw_response and message_count == 1 and current_message_id:
+        try:
+            await bot.edit_message_text(
+                "К сожалению, не удалось получить ответ от AI.",
+                chat_id=chat_id,
+                message_id=current_message_id,
+                reply_markup=None
+            )
+            await message.answer("🫡", reply_markup=main_menu_keyboard())
+        except TelegramAPIError:
+            pass
+
+    # Сохраняем полный ответ в БД
+    if full_raw_response:
+        try:
+            await add_message_to_db(db, user_id, "assistant", full_raw_response)
+        except Exception as e:
+            logger.error(f"Ошибка сохранения ответа в БД: {e}")
 
 # --- Обработчики для кнопок меню ReplyKeyboardMarkup
 @dp.message(F.text == "🔄 Новый диалог")
