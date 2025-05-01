@@ -22,7 +22,7 @@ pip3 install -r requirements.txt
 
 ```
 TELEGRAM_BOT_TOKEN=ваш_токен_бота
-DEEPSEEK_API_KEY=ваш_ключ_api
+XAI_API_KEY=ваш_ключ_api
 
 # Для локальной разработки используем SQLite
 DATABASE_URL=sqlite:///./telegram_bot.db
@@ -34,7 +34,7 @@ DATABASE_URL=sqlite:///./telegram_bot.db
 
 ```
 TELEGRAM_BOT_TOKEN=ваш_токен_бота
-DEEPSEEK_API_KEY=ваш_ключ_api
+XAI_API_KEY=ваш_ключ_api
 
 # Рабочая база данных PostgreSQL
 DATABASE_URL=postgresql://username:password@host/database_name
@@ -50,6 +50,7 @@ python3 main.py
 
 - `/start` - Начать общение с ботом
 - `/clear` - Очистить историю диалога
+- Отправьте фото — бот опишет изображение и ответ вернётся в режиме стриминга
 
 ## Устранение неполадок
 

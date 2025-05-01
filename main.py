@@ -25,6 +25,9 @@ import datetime
 from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
+from openai import OpenAI, AsyncOpenAI  # клиенты xAI для текстовых и vision-моделей
+from openai import APIStatusError  # ошибки при работе с визуальной моделью
+from PIL import Image  # для конвертации любых форматов изображений
 
 # Настройка логирования
 logging.basicConfig(
@@ -111,6 +114,16 @@ class Settings(BaseSettings):
 
 # Инициализация настроек
 settings = Settings()
+# Инициализация клиента xAI для vision-модели
+vision_client = OpenAI(
+    api_key=settings.XAI_API_KEY,
+    base_url="https://api.x.ai/v1",
+)
+# Инициализация асинхронного клиента xAI для vision-модели (стриминг)
+vision_async_client = AsyncOpenAI(
+    api_key=settings.XAI_API_KEY,
+    base_url="https://api.x.ai/v1",
+)
 
 # Проверка наличия токенов
 if not settings.TELEGRAM_BOT_TOKEN:
@@ -923,7 +936,7 @@ async def message_handler(message: types.Message):
                 )
                 # затем показываем ReplyKeyboardMarkup меню новым сообщением
                 await message.answer(
-                    "Выберите действие или введите вопрос...",
+                    "🫡",
                     reply_markup=main_menu_keyboard()
                 )
                 logger.info(f"Последнее сообщение {message_count} {'RAW' if formatting_failed else 'HTML'} отправлено.")
@@ -966,7 +979,7 @@ async def message_handler(message: types.Message):
                     reply_markup=None
                 )
                 await message.answer(
-                    "Выберите действие или введите вопрос...",
+                    "🫡",
                     reply_markup=main_menu_keyboard()
                 )
             except TelegramAPIError:
@@ -1022,7 +1035,7 @@ async def cancel_generation_callback(callback: types.CallbackQuery):
 
     # Показываем главное меню
     await callback.message.answer(
-        "Выберите действие или введите вопрос...",
+        "🫡",
         reply_markup=main_menu_keyboard()
     )
 
@@ -1149,29 +1162,97 @@ async def clear_command_handler(message: types.Message):
         logger.exception(f"Ошибка при очистке истории (/clear) для user_id={user_id}: {e}")
         await message.answer("Произошла ошибка при очистке истории.")
 
-# --- Обработчики медиа (без изменений) ---
+# --- Обработчики медиа (обновлено для vision) ---
 @dp.message(F.photo)
 async def photo_handler(message: types.Message):
     user_id = message.from_user.id
-    caption = message.caption or ""
-    logger.info(f"Получено фото от user_id={user_id} с подписью: '{caption[:50]}...'")
+    chat_id = message.chat.id
 
-    # Пока просто отвечаем, что фото получено, но не обрабатывается LLM
-    if caption:
-         await message.reply("Я получил ваше фото с подписью. Обработка изображений пока не поддерживается, но я могу ответить на текст подписи.")
-         # Создаем фейковое текстовое сообщение для передачи в message_handler
-         fake_text_message = types.Message(
-             message_id=message.message_id + 1, # Уникальный ID
-             date=message.date,
-             chat=message.chat,
-             from_user=message.from_user,
-             text=caption,
-             # Добавьте другие необходимые поля, если они используются где-то
-         )
-         # Вызываем основной обработчик текста
-         await message_handler(fake_text_message)
-    else:
-        await message.reply("Я получил ваше фото. Вы можете задать вопрос о нем в следующем сообщении или отправить фото с подписью.")
+    # Проверка зависимостей
+    db = dp.workflow_data.get('db')
+    current_settings = dp.workflow_data.get('settings')
+    if not db or not current_settings:
+        logger.error("Не удалось получить соединение с БД или настройки при обработке изображения")
+        await message.answer("Внутренняя ошибка при обработке изображения.", reply_markup=None)
+        return
+
+    caption = message.caption or ""
+    logger.info(f"Получено фото от user_id={user_id} с подписью: '{caption[:50]}...'" )
+
+    try:
+        # Скачиваем и конвертируем изображение в JPEG (любой формат через Pillow)
+        photo: types.PhotoSize = message.photo[-1]
+        bio = io.BytesIO()
+        await bot.download(photo, destination=bio)
+        bio.seek(0)
+        img = Image.open(bio).convert('RGB')
+        conv_bio = io.BytesIO()
+        img.save(conv_bio, format='JPEG', quality=90)
+        conv_bio.seek(0)
+        encoded = base64.b64encode(conv_bio.getvalue()).decode()
+        data_url = f"data:image/jpeg;base64,{encoded}"
+
+        # Стриминг ответа vision-модели
+        placeholder = await message.answer("⏳", reply_markup=progress_keyboard(user_id))
+        current_text = ""
+        last_edit = time.monotonic()
+        edit_interval = 1.5
+        # Запрашиваем поток
+        stream = await vision_async_client.chat.completions.create(
+            model="grok-2-vision-1212",
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": [
+                    {"type": "image_url", "image_url": {"url": data_url, "detail": "high"}},
+                    {"type": "text", "text": caption or "Опишите, пожалуйста, это изображение."}
+                ]}
+            ],
+            stream=True
+        )
+        async for chunk in stream:
+            delta = getattr(chunk.choices[0].delta, 'content', '') or ''
+            current_text += delta
+            now = time.monotonic()
+            if now - last_edit > edit_interval:
+                # Подготавливаем безопасное превью, обрезая по длине
+                html_preview = markdown_to_telegram_html(current_text)
+                if len(html_preview) > TELEGRAM_MAX_LENGTH - 3:
+                    html_preview = html_preview[:TELEGRAM_MAX_LENGTH - 3]
+                preview = html_preview + '...'
+                try:
+                    await bot.edit_message_text(
+                        text=preview,
+                        chat_id=chat_id,
+                        message_id=placeholder.message_id,
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=progress_keyboard(user_id)
+                    )
+                except TelegramAPIError as e:
+                    logger.warning(f"Превышена длина превью, пропускаю обновление: {e}")
+                last_edit = now
+
+        # Финальная отрисовка
+        final_html = markdown_to_telegram_html(current_text)
+        # Разбиваем на части для Telegram
+        parts = split_text(final_html)
+        # Редактируем плейсхолдер первым фрагментом
+        await bot.edit_message_text(
+            text=parts[0],
+            chat_id=chat_id,
+            message_id=placeholder.message_id,
+            parse_mode=ParseMode.HTML,
+            reply_markup=None
+        )
+        # Отправляем остальные части отдельными сообщениями
+        for part in parts[1:]:
+            await message.answer(part, parse_mode=ParseMode.HTML)
+
+        # Сохранить ответ и показать меню
+        await add_message_to_db(db, user_id, "assistant", current_text)
+        await message.answer("🫡", reply_markup=main_menu_keyboard())
+    except Exception as e:
+        logger.exception(f"Критическая ошибка в photo_handler для user_id={user_id}: {e}")
+        await message.answer("Не удалось обработать изображение. Попробуйте позже.", reply_markup=main_menu_keyboard())
 
 @dp.message(F.document)
 async def document_handler(message: types.Message):
