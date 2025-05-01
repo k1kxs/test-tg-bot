@@ -172,7 +172,24 @@ async def init_sqlite_db(db_path):
             cursor.execute('''
                 CREATE INDEX IF NOT EXISTS idx_user_id_timestamp ON conversations (user_id, timestamp DESC)
             ''')
+            # Добавляем создание таблицы users
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id INTEGER PRIMARY KEY,      -- Telegram User ID
+                    username TEXT NULL,
+                    first_name TEXT NOT NULL,
+                    last_name TEXT NULL,
+                    registration_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_active_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    free_messages_today INTEGER DEFAULT 3,
+                    last_free_reset_date TEXT DEFAULT (date('now')), -- Используем TEXT для даты в SQLite
+                    subscription_status TEXT DEFAULT 'inactive' CHECK (subscription_status IN ('inactive', 'active')),
+                    subscription_expires TIMESTAMP NULL,
+                    is_admin BOOLEAN DEFAULT FALSE -- Добавим поле для админов
+                )
+            ''')
             conn.commit()
+            logger.info("Таблица 'users' для SQLite инициализирована.") # Добавляем лог
             conn.close()
 
         await asyncio.to_thread(_init_db)
@@ -196,8 +213,31 @@ async def init_db_postgres(pool: asyncpg.Pool):
             CREATE INDEX IF NOT EXISTS idx_user_id_timestamp ON conversations (user_id, timestamp DESC);
             ''')
             logger.info("Таблица conversations успешно инициализирована (PostgreSQL)")
+
+            # Добавляем создание таблицы users для PostgreSQL
+            try:
+                await connection.execute('''
+                    CREATE TABLE IF NOT EXISTS users (
+                        user_id BIGINT PRIMARY KEY,      -- Telegram User ID
+                        username TEXT NULL,
+                        first_name TEXT NOT NULL,
+                        last_name TEXT NULL,
+                        registration_date TIMESTAMPTZ DEFAULT NOW(),
+                        last_active_date TIMESTAMPTZ DEFAULT NOW(),
+                        free_messages_today INTEGER DEFAULT 3,
+                        last_free_reset_date DATE DEFAULT CURRENT_DATE,
+                        subscription_status TEXT DEFAULT 'inactive' CHECK (subscription_status IN ('inactive', 'active')),
+                        subscription_expires TIMESTAMPTZ NULL,
+                        is_admin BOOLEAN DEFAULT FALSE -- Добавим поле для админов
+                    );
+                ''')
+                logger.info("Таблица 'users' для PostgreSQL успешно инициализирована.")
+            except asyncpg.PostgresError as e:
+                 logger.error(f"Ошибка инициализации таблицы users PostgreSQL: {e}")
+                 raise # Перебрасываем исключение, чтобы остановить инициализацию, если таблица users не создалась
+
         except asyncpg.PostgresError as e:
-            logger.error(f"Ошибка инициализации БД PostgreSQL: {e}")
+            logger.error(f"Ошибка инициализации БД PostgreSQL (таблица conversations): {e}") # Уточняем лог
             raise
         except Exception as e:
             logger.exception(f"Непредвиденная ошибка инициализации БД PostgreSQL: {e}")
@@ -337,7 +377,7 @@ async def stream_xai_response(api_key: str, system_prompt: str, history: list[di
         "model": "grok-3-mini-beta",
         "messages": messages,
         "stream": True,
-        "temperature": 0.3,
+        "temperature": 0.7,
         "reasoning": {"effort": "high"},
     }
     # Таймаут для запроса (в секундах)
@@ -554,7 +594,7 @@ async def message_handler(message: types.Message):
 
     # Получаем зависимости из workflow_data
     db = dp.workflow_data.get('db')
-    current_settings = dp.workflow_data.get('settings') # Используем current_settings
+    current_settings = dp.workflow_data.get('settings')
 
     if not db or not current_settings:
         logger.error("Не удалось получить соединение с БД или настройки")
@@ -564,6 +604,7 @@ async def message_handler(message: types.Message):
     # Показываем индикатор "печатает"
     await bot.send_chat_action(chat_id=chat_id, action="typing")
 
+    current_message_id = None # Объявляем здесь, чтобы быть доступным в finally/except
     try:
         # Сохраняем сообщение пользователя
         await add_message_to_db(db, user_id, "user", user_text)
@@ -573,216 +614,189 @@ async def message_handler(message: types.Message):
         history = await get_last_messages(db, user_id, limit=CONVERSATION_HISTORY_LIMIT)
         logger.info(f"Получена история сообщений для пользователя {user_id}, записей: {len(history)}")
 
-        # Инициализация переменных для стриминга из старой версии
-        full_raw_response = ""      # Полный сырой ответ от модели для БД и разбиения
-        current_message_id = None   # ID текущего редактируемого сообщения
-        last_edit_time = 0          # Время последнего редактирования (используем time.monotonic)
-        edit_interval = 1.5         # Интервал троттлинга (секунды) - можно увеличить
-        formatting_failed = False   # Флаг, если HTML парсинг вызвал ошибку
+        # --- Новая логика стриминга с авто-разбиением ---
+        full_raw_response = ""
+        current_message_text = "" # Текст для текущего сообщения TG
+        placeholder_message = None
+        message_count = 0 # Счетчик отправленных сообщений (частей)
+        last_edit_time = 0
+        edit_interval = 1.5
+        formatting_failed = False
 
-        # Отправка начального сообщения-плейсхолдера из старой версии
+        # Отправка самого первого плейсхолдера
         try:
-            placeholder_message = await message.answer("⏳ Генерирую ответ...")
+            placeholder_message = await message.answer("⏳") # Короткий плейсхолдер
             current_message_id = placeholder_message.message_id
+            message_count = 1
             last_edit_time = time.monotonic()
         except TelegramAPIError as e:
-            logger.error(f"Ошибка отправки плейсхолдера: {e}")
-            return # Не можем продолжить без начального сообщения
+            logger.error(f"Ошибка отправки начального плейсхолдера: {e}")
+            return # Не можем продолжить
 
-        # Старый цикл стриминга, адаптированный под stream_xai_response
         async for chunk in stream_xai_response(current_settings.XAI_API_KEY, SYSTEM_PROMPT, history):
+            if not current_message_id: # Если отправка плейсхолдера не удалась или сообщение было удалено
+                 logger.warning("Прерывание стриминга, так как нет активного message_id.")
+                 break
+
             full_raw_response += chunk
             now = time.monotonic()
 
-            # Редактируем сообщение с троттлингом
-            if now - last_edit_time > edit_interval and current_message_id:
+            # Проверяем, не превысит ли добавление чанка лимит ТЕКУЩЕГО сообщения
+            tentative_next_text = current_message_text + chunk
+            try:
+                # Проверяем длину с учетом HTML и "..."
+                html_to_check = markdown_to_telegram_html(tentative_next_text) + "..."
+                check_formatting_failed = False
+            except Exception as fmt_err:
+                logger.warning(f"Formatting error during length check: {fmt_err}")
+                html_to_check = tentative_next_text + "..." # Проверяем raw длину
+                check_formatting_failed = True
+                formatting_failed = True # Отмечаем глобально
+
+            if len(html_to_check) > TELEGRAM_MAX_LENGTH:
+                # Лимит превышен, финализируем текущее сообщение
+                logger.info(f"Финализация сообщения {message_count} (ID: {current_message_id}) из-за длины.")
                 try:
-                    # Форматируем ВЕСЬ накопленный текст в HTML
-                    html_to_send = markdown_to_telegram_html(full_raw_response)
-
-                    # Добавляем индикатор продолжения "..."
-                    text_to_show = html_to_send + "..."
-
-                    # Проверяем длину перед отправкой
-                    if len(text_to_show) > TELEGRAM_MAX_LENGTH:
-                        logger.warning(f"Длина сообщения {len(text_to_show)} превышает лимит {TELEGRAM_MAX_LENGTH}, пропускаем редактирование.")
-                        continue # Пропустить текущее редактирование
-
+                    final_part_html = markdown_to_telegram_html(current_message_text) if not formatting_failed else current_message_text
+                    if final_part_html: # Редактируем только если есть текст
+                        await bot.edit_message_text(
+                            text=final_part_html,
+                            chat_id=chat_id,
+                            message_id=current_message_id,
+                            parse_mode=None if formatting_failed else ParseMode.HTML,
+                            reply_markup=None # Без клавиатуры у промежуточных
+                        )
+                except TelegramAPIError as e:
+                    logger.error(f"Ошибка финализации сообщения {message_count}: {e}")
                     if not formatting_failed:
+                        formatting_failed = True
+                        logger.warning("Переключение на raw из-за ошибки финализации.")
+                        try:
+                            if current_message_text:
+                                await bot.edit_message_text(text=current_message_text, chat_id=chat_id, message_id=current_message_id, parse_mode=None, reply_markup=None)
+                        except TelegramAPIError as plain_e:
+                            logger.error(f"Ошибка raw финализации сообщения {message_count}: {plain_e}")
+                            current_message_id = None # Теряем это сообщение
+                    else:
+                        logger.error(f"Ошибка raw финализации сообщения {message_count}. Сообщение потеряно.")
+                        current_message_id = None
+
+                # Начинаем новое сообщение
+                current_message_text = chunk # Начинаем с нового чанка
+                message_count += 1
+                try:
+                    placeholder_message = await message.answer("...") # Плейсхолдер для новой части
+                    current_message_id = placeholder_message.message_id
+                    last_edit_time = time.monotonic()
+                    logger.info(f"Начато новое сообщение {message_count} (ID: {current_message_id})")
+                except TelegramAPIError as e:
+                    logger.error(f"Ошибка отправки плейсхолдера для сообщения {message_count}: {e}")
+                    current_message_id = None
+                    break # Прерываем стрим, если не можем создать новое сообщение
+
+            else:
+                # Лимит не превышен, добавляем чанк к текущему тексту
+                current_message_text += chunk
+
+                # Редактируем текущее сообщение с троттлингом
+                if now - last_edit_time > edit_interval:
+                    try:
+                        html_to_send = markdown_to_telegram_html(current_message_text) if not formatting_failed else current_message_text
+                        text_to_show = html_to_send + "..."
+
                         await bot.edit_message_text(
                             text=text_to_show,
                             chat_id=chat_id,
                             message_id=current_message_id,
-                            parse_mode=ParseMode.HTML # Явно указываем HTML
-                        )
-                    else:
-                        # Если форматирование ранее не удалось, отправляем сырой текст
-                        await bot.edit_message_text(
-                            text=full_raw_response + "...", # Сырой текст
-                            chat_id=chat_id,
-                            message_id=current_message_id,
-                            parse_mode=None # Без форматирования
-                        )
-                    last_edit_time = now
-
-                except TelegramRetryAfter as e:
-                    logger.warning(f"Превышен лимит запросов (RetryAfter), ожидание {e.retry_after}с")
-                    await asyncio.sleep(e.retry_after + 0.1) # Ждем чуть дольше
-                    last_edit_time = time.monotonic() # Сбрасываем таймер после ожидания
-                except TelegramAPIError as e:
-                    logger.error(f"Ошибка редактирования сообщения с HTML: {e}. Текст (начало): {html_to_send[:100]}...")
-                    # Попробуем отправить без форматирования
-                    try:
-                        logger.warning("Попытка отредактировать сообщение без форматирования.")
-                        await bot.edit_message_text(
-                            text=full_raw_response + "...", # Сырой текст
-                            chat_id=chat_id,
-                            message_id=current_message_id,
-                            parse_mode=None # Без форматирования
+                            parse_mode=None if formatting_failed else ParseMode.HTML
                         )
                         last_edit_time = now
-                        formatting_failed = True # Помечаем, что HTML не работает для этого сообщения
-                    except TelegramAPIError as plain_error:
-                        logger.error(f"Ошибка редактирования даже без форматирования: {plain_error}")
-                        # Если сообщение не найдено, прекращаем попытки редактирования
-                        if "message to edit not found" in str(plain_error).lower() or \
-                           "message can't be edited" in str(plain_error).lower() or \
-                           "message is not modified" in str(plain_error).lower():
-                            logger.warning("Сообщение не найдено или не может быть изменено, прекращаем редактирование.")
-                            current_message_id = None # Сбрасываем ID
-                            break # Выходим из цикла стриминга
-                        # Иначе просто пропускаем это редактирование
-                except Exception as e:
-                     logger.exception(f"Неожиданная ошибка при редактировании сообщения: {e}")
-                     # Можно добавить fallback или просто пропустить
-
-        # После завершения стрима - отправляем/редактируем финальное сообщение
-        if current_message_id:
-            try:
-                final_html = markdown_to_telegram_html(full_raw_response)
-                final_keyboard_markup = final_keyboard() # Получаем финальную клавиатуру
-
-                # Разбиение на части, если необходимо (логика из split_text)
-                message_parts = split_text(final_html, TELEGRAM_MAX_LENGTH)
-
-                if not message_parts: # Если после форматирования текст пустой
-                     message_parts = split_text(full_raw_response, TELEGRAM_MAX_LENGTH) # Попробуем разбить сырой текст
-                     formatting_failed = True # Считаем, что форматирование не удалось
-
-                if not message_parts: # Если и сырой текст пустой
-                    logger.warning("Финальный ответ пуст после форматирования и в сыром виде.")
-                    # Удаляем плейсхолдер или заменяем на сообщение об ошибке
-                    try:
-                        await bot.delete_message(chat_id=chat_id, message_id=current_message_id)
-                    except TelegramAPIError:
-                        try: # Попытка отредактировать, если удаление не удалось
-                            await bot.edit_message_text(
-                                text="К сожалению, не удалось сгенерировать ответ.",
-                                chat_id=chat_id,
-                                message_id=current_message_id
-                            )
-                        except TelegramAPIError:
-                            logger.error("Не удалось ни удалить, ни отредактировать плейсхолдер для пустого ответа.")
-                    current_message_id = None # Сбрасываем ID
-                else:
-                    # Редактируем первое сообщение (плейсхолдер) первой частью
-                    try:
-                        await bot.edit_message_text(
-                            text=message_parts[0],
-                            chat_id=chat_id,
-                            message_id=current_message_id,
-                            parse_mode=None if formatting_failed else ParseMode.HTML,
-                            reply_markup=final_keyboard_markup if len(message_parts) == 1 else None # Клавиатура только у последнего сообщения
-                        )
-                        logger.info(f"Финальный ответ (часть 1/{len(message_parts)}) {'RAW' if formatting_failed else 'HTML'} отправлен пользователю {user_id}")
+                    except TelegramRetryAfter as e:
+                        logger.warning(f"Throttled: RetryAfter {e.retry_after}s")
+                        await asyncio.sleep(e.retry_after + 0.1)
+                        last_edit_time = time.monotonic()
                     except TelegramAPIError as e:
-                        logger.error(f"Ошибка редактирования финального сообщения (часть 1): {e}. Попытка без форматирования.")
-                        try:
-                             await bot.edit_message_text(
-                                text=split_text(full_raw_response, TELEGRAM_MAX_LENGTH)[0], # Первая часть сырого текста
-                                chat_id=chat_id,
-                                message_id=current_message_id,
-                                parse_mode=None,
-                                reply_markup=final_keyboard_markup if len(message_parts) == 1 else None
-                            )
-                             formatting_failed = True # Форматирование точно не сработало
-                             logger.info(f"Финальный ответ (часть 1/{len(message_parts)}) RAW отправлен пользователю {user_id} после ошибки HTML")
-                        except TelegramAPIError as plain_final_error:
-                             logger.error(f"Ошибка редактирования финального сообщения (часть 1) даже без форматирования: {plain_final_error}")
-                             # Отправляем как новое сообщение, если редактирование не удалось
-                             try:
-                                 new_msg = await message.answer(
-                                     text=message_parts[0],
-                                     parse_mode=None if formatting_failed else ParseMode.HTML,
-                                     reply_markup=final_keyboard_markup if len(message_parts) == 1 else None
-                                 )
-                                 current_message_id = new_msg.message_id # Обновляем ID на новое сообщение
-                             except Exception as send_err:
-                                 logger.error(f"Не удалось отправить первую часть как новое сообщение: {send_err}")
-                                 current_message_id = None # Не можем продолжить
+                         logger.error(f"Ошибка редактирования сообщения {message_count} (mid-stream): {e}")
+                         # Проверяем, не пропало ли сообщение
+                         if any(msg in str(e).lower() for msg in ("message to edit not found", "message can't be edited", "message is not modified")):
+                             logger.warning(f"Сообщение {message_count} (ID: {current_message_id}) больше недоступно для редактирования.")
+                             current_message_id = None
+                             # Не прерываем цикл, т.к. следующий чанк может создать новое сообщение
+                         elif not formatting_failed: # Если ошибка не связана с пропажей сообщения, и мы еще не перешли на raw
+                             formatting_failed = True
+                             logger.warning("Переключение на raw из-за ошибки редактирования.")
+                         # Если уже raw или ошибка была другая, просто пропускаем это редактирование
+                    except Exception as e:
+                         logger.exception(f"Неожиданная ошибка редактирования сообщения {message_count}: {e}")
 
 
-                    # Отправляем остальные части новыми сообщениями
-                    if current_message_id: # Продолжаем, только если удалось отправить/отредактировать первую часть
-                        for i in range(1, len(message_parts)):
-                            try:
-                                await asyncio.sleep(0.1) # Небольшая пауза между сообщениями
-                                await message.answer(
-                                    text=message_parts[i],
-                                    parse_mode=None if formatting_failed else ParseMode.HTML,
-                                    reply_markup=final_keyboard_markup if i == len(message_parts) - 1 else None
-                                )
-                                logger.info(f"Финальный ответ (часть {i+1}/{len(message_parts)}) {'RAW' if formatting_failed else 'HTML'} отправлен пользователю {user_id}")
-                            except TelegramAPIError as e:
-                                logger.error(f"Ошибка отправки части {i+1} финального сообщения: {e}")
-                                # Можно попробовать отправить без форматирования или остановить отправку
-                                try:
-                                    await message.answer(
-                                        text=split_text(full_raw_response, TELEGRAM_MAX_LENGTH)[i],
-                                        parse_mode=None,
-                                        reply_markup=final_keyboard_markup if i == len(message_parts) - 1 else None
-                                    )
-                                except Exception as send_err_part:
-                                     logger.error(f"Не удалось отправить часть {i+1} даже без форматирования: {send_err_part}")
-                                     break # Прерываем отправку остальных частей
+        # --- Финализация ПОСЛЕДНЕГО сообщения после цикла ---
+        if current_message_id and current_message_text:
+            logger.info(f"Финализация последнего сообщения {message_count} (ID: {current_message_id})")
+            try:
+                final_html = markdown_to_telegram_html(current_message_text) if not formatting_failed else current_message_text
+                final_keyboard_markup = final_keyboard() # Клавиатура только у последнего
 
-            except TelegramRetryAfter as e:
-                logger.warning(f"Превышен лимит запросов (RetryAfter) при отправке финального сообщения, ожидание {e.retry_after}с")
-                await asyncio.sleep(e.retry_after + 0.1)
-                # TODO: Добавить повторную попытку отправки финального сообщения
-            except Exception as e:
-                logger.exception(f"Неожиданная ошибка при отправке финального сообщения: {e}")
-                # Попытка отправить простое сообщение об ошибке, если плейсхолдер еще существует
-                if current_message_id:
+                await bot.edit_message_text(
+                    text=final_html,
+                    chat_id=chat_id,
+                    message_id=current_message_id,
+                    parse_mode=None if formatting_failed else ParseMode.HTML,
+                    reply_markup=final_keyboard_markup
+                )
+                logger.info(f"Последнее сообщение {message_count} {'RAW' if formatting_failed else 'HTML'} отправлено.")
+
+            except TelegramAPIError as e:
+                logger.error(f"Ошибка финализации последнего сообщения {message_count}: {e}")
+                # Попытка отправить raw как fallback
+                try:
+                    await bot.edit_message_text(
+                        text=current_message_text, # Raw
+                        chat_id=chat_id,
+                        message_id=current_message_id,
+                        parse_mode=None,
+                        reply_markup=final_keyboard_markup
+                    )
+                    logger.info(f"Последнее сообщение {message_count} RAW отправлено после ошибки HTML.")
+                except TelegramAPIError as plain_e:
+                    logger.error(f"Ошибка raw финализации последнего сообщения {message_count}: {plain_e}")
+                    # Как крайняя мера, отправить новым сообщением
                     try:
-                        await bot.edit_message_text("Произошла ошибка при формировании финального ответа.", chat_id=chat_id, message_id=current_message_id)
-                    except TelegramAPIError:
-                         pass # Игнорировать ошибку, если не можем отредактировать
+                         await message.answer(
+                             text=current_message_text,
+                             parse_mode=None,
+                             reply_markup=final_keyboard_markup
+                         )
+                         logger.info(f"Последняя часть {message_count} отправлена новым сообщением после ошибки редактирования.")
+                    except Exception as final_send_err:
+                         logger.error(f"Не удалось отправить последнюю часть {message_count} новым сообщением: {final_send_err}")
 
-        # Сохраняем ПОЛНЫЙ СЫРОЙ ответ ассистента в БД
+        elif not full_raw_response and message_count == 1 and current_message_id:
+            # Если API ничего не вернуло после первого плейсхолдера
+            logger.warning(f"Не получен ответ от XAI для пользователя {user_id}")
+            try:
+                await bot.edit_message_text("К сожалению, не удалось получить ответ от AI.", chat_id=chat_id, message_id=current_message_id, reply_markup=None)
+            except TelegramAPIError:
+                pass # Игнорируем, если сообщение уже удалено
+
+        # --- Сохранение полного ответа в БД ---
         if full_raw_response:
             try:
                 await add_message_to_db(db, user_id, "assistant", full_raw_response)
                 logger.info(f"Ответ ассистента (RAW) для пользователя {user_id} сохранен в БД")
             except Exception as e:
                 logger.error(f"Ошибка сохранения ответа ассистента в БД: {e}")
-        else:
-             logger.warning(f"Не получен или пустой ответ от XAI для пользователя {user_id}")
-             # Если было начальное сообщение-плейсхолдер, отредактируем его на сообщение об ошибке
-             if current_message_id:
-                 try:
-                      await bot.edit_message_text("К сожалению, не удалось получить ответ от AI.", chat_id=chat_id, message_id=current_message_id)
-                 except TelegramAPIError:
-                      pass # Игнорируем ошибку, если не можем отредактировать
+        # (Логика для случая else: logger.warning(f"Не получен или пустой ответ...) обработана выше
 
     except Exception as e:
         logger.exception(f"Критическая ошибка в обработчике сообщений для user_id={user_id}: {e}")
         try:
-            # Пытаемся отредактировать плейсхолдер, если он был создан
+            # Пытаемся отредактировать последнее известное сообщение об ошибке
+            error_message = "Произошла серьезная ошибка при обработке вашего запроса."
             if current_message_id:
-                 await bot.edit_message_text("Произошла серьезная ошибка при обработке вашего запроса.", chat_id=chat_id, message_id=current_message_id)
-            else: # Иначе отправляем новое сообщение
-                await message.answer("Произошла серьезная ошибка при обработке вашего запроса. Пожалуйста, попробуйте позже или используйте команду /start для сброса.")
+                 await bot.edit_message_text(error_message, chat_id=chat_id, message_id=current_message_id, reply_markup=None)
+            else: # Или отправляем новое, если ID нет
+                await message.answer(error_message + " Пожалуйста, попробуйте позже или используйте команду /start для сброса.")
         except TelegramAPIError:
              logger.error("Не удалось даже отправить сообщение об ошибке пользователю.")
 
