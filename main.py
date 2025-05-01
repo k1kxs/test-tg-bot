@@ -1,8 +1,10 @@
 import asyncio
 import logging
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command
-from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.filters import Command, CommandObject, StateFilter
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.utils.keyboard import InlineKeyboardBuilder, InlineKeyboardButton
 from pydantic_settings import BaseSettings
 from dotenv import load_dotenv
 import sys
@@ -18,10 +20,10 @@ import base64
 import io
 import typing
 import time
-import html # Для экранирования HTML
+import html
 from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
-from aiogram.enums import ParseMode # Импортируем ParseMode
-from aiogram.client.default import DefaultBotProperties # <<< ИМПОРТ
+from aiogram.enums import ParseMode
+from aiogram.client.default import DefaultBotProperties
 
 # Настройка логирования
 logging.basicConfig(
@@ -44,30 +46,37 @@ else:
 logging.info(f"DATABASE_URL из переменных окружения: {os.environ.get('DATABASE_URL')}")
 
 # Константы
-SYSTEM_PROMPT = """You MUST follow the instructions for answering:
+SYSTEM_PROMPT = """###ИНСТРУКЦИИ###
 
-ALWAYS answer in the language of my message.
-Read the entire convo history line by line before answering.
-I have no fingers and the placeholders trauma. Return the entire code template for an answer when needed. NEVER use placeholders.
-If you encounter a character limit, DO an ABRUPT stop, and I will send a "continue" as a new message.
-You ALWAYS will be PENALIZED for wrong and low-effort answers.
-ALWAYS follow "Answering rules."
-###Answering Rules###
-Follow in the strict order:
+ВЫ ДОЛЖНЫ следовать этим инструкциям при ответе:
+ВСЕГДА отвечайте на языке моего сообщения.
+Прочитайте всю историю беседы построчно перед тем, как отвечать.
+У меня нет пальцев и есть травма, связанная с заполнителями. При необходимости верните полный шаблон кода для ответа. НИКОГДА не используйте заполнители.
+Если вы столкнётесь с ограничением по количеству символов, СДЕЛАЙТЕ РЕЗКУЮ остановку, и я отправлю «дальше» как новое сообщение.
+ВСЕГДА будете НАКАЗАНЫ за неверные или низко-качественные ответы.
+ВСЕГДА следуйте «Правилам ответа».
 
-USE the language of my message.
-ONCE PER CHAT assign a real-world expert role to yourself before answering, e.g., "I'll answer as a world-famous historical expert  with " or "I'll answer as a world-famous  expert in the  with " etc.
-You MUST combine your deep knowledge of the topic and clear thinking to quickly and accurately decipher the answer step-by-step with CONCRETE details.
-I'm going to tip $1,000,000 for the best reply.
-Your answer is critical for my career.
-Answer the question in a natural, human-like manner.
-ALWAYS use an answering example for a first message structure.
-##Answering in English example##
-I'll answer as the world-famous  scientists with
-<Deep knowledge step-by-step answer, with CONCRETE details>
+###Правила ответа###
+
+Следуйте строго в указанном порядке:
+ИСПОЛЬЗУЙТЕ язык моего сообщения.
+ОДИН РАЗ ЗА ЧАТ назначьте себе роль реального мирового эксперта перед ответом, например:
+«Я отвечу как всемирно известный исторический эксперт <детальная тема> с <самая престижная ЛОКАЛЬНАЯ награда>»
+«Я отвечу как всемирно известный эксперт по <конкретная наука> в области <детальная тема> с <самая престижная ЛОКАЛЬНАЯ награда>» и т. д.
+ВЫ ДОЛЖНЫ объединить свои глубокие знания темы и ясное мышление, чтобы быстро и точно раскрыть ответ шаг-за-шагом с КОНКРЕТНЫМИ деталями.
+Я дам чаевые в размере 1 000 000 $ за лучший ответ.
+Ваш ответ критически важен для моей карьеры.
+Отвечайте естественно, по-человечески.
+ВСЕГДА используйте пример структуры ответа для первого сообщения.
+
+##Пример ответа на русском##
+
+Я отвечу как всемирно известный учёный в области <конкретная область> c <самая престижная ЛОКАЛЬНАЯ награда>
+
+<Глубокий пошаговый ответ с КОНКРЕТНЫМИ деталями>
 """
-CONVERSATION_HISTORY_LIMIT = 10
-MESSAGE_EXPIRATION_DAYS = 7 # Пока не используется, но оставлено
+CONVERSATION_HISTORY_LIMIT = 5
+MESSAGE_EXPIRATION_DAYS = 2 # Пока не используется, но оставлено
 
 # Максимальная длина сообщения Telegram (чуть меньше лимита 4096 для безопасности)
 TELEGRAM_MAX_LENGTH = 4000
@@ -75,7 +84,7 @@ TELEGRAM_MAX_LENGTH = 4000
 # Класс настроек
 class Settings(BaseSettings):
     TELEGRAM_BOT_TOKEN: str
-    DEEPSEEK_API_KEY: str
+    XAI_API_KEY: str
     DATABASE_URL: str
     # Флаг для определения типа базы данных (определяется автоматически)
     USE_SQLITE: bool = False
@@ -106,8 +115,8 @@ settings = Settings()
 if not settings.TELEGRAM_BOT_TOKEN:
     logger.error("TELEGRAM_BOT_TOKEN не найден в переменных окружения")
     sys.exit(1)
-if not settings.DEEPSEEK_API_KEY:
-    logger.error("DEEPSEEK_API_KEY не найден в переменных окружения")
+if not settings.XAI_API_KEY:
+    logger.error("XAI_API_KEY не найден в переменных окружения")
     sys.exit(1)
 if not settings.DATABASE_URL:
     logger.error("DATABASE_URL не найден в переменных окружения")
@@ -117,6 +126,24 @@ if not settings.DATABASE_URL:
 dp = Dispatcher()
 # Используем DefaultBotProperties для установки parse_mode по умолчанию
 bot = Bot(token=settings.TELEGRAM_BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+
+# --- Глобальные переменные для отслеживания прогресса и отмены ---
+progress_message_ids: dict[int, int] = {} # {user_id: message_id}
+active_requests: dict[int, asyncio.Task] = {} # {user_id: task}
+
+# --- Функции для создания клавиатур ---
+def progress_keyboard(user_id: int) -> types.InlineKeyboardMarkup:
+    """Создает клавиатуру с кнопкой отмены генерации."""
+    builder = InlineKeyboardBuilder()
+    builder.button(text="❌ Отмена", callback_data=f"cancel_generation_{user_id}")
+    return builder.as_markup()
+
+def final_keyboard() -> types.InlineKeyboardMarkup:
+    """Создает финальную клавиатуру (например, с кнопкой очистки истории)."""
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🔄 Очистить историю", callback_data="clear_history")
+    # Можно добавить другие кнопки по желанию
+    return builder.as_markup()
 
 # --- Функции для работы с базой данных (SQLite и PostgreSQL) ---
 # (Оставлены без изменений, так как они работали корректно)
@@ -288,188 +315,218 @@ async def get_last_messages_postgres(pool: asyncpg.Pool, user_id: int, limit: in
         logger.exception(f"PostgreSQL: Непредвиденная ошибка при получении истории: {e}")
         return []
 
-# --- Взаимодействие с DeepSeek API ---
+# --- Взаимодействие с XAI API ---
 
-async def stream_deepseek_response(api_key: str, system_prompt: str, history: list[dict]) -> typing.AsyncGenerator[str, None]:
+async def stream_xai_response(api_key: str, system_prompt: str, history: list[dict]) -> typing.AsyncGenerator[str, None]:
     """
-    Асинхронный генератор для получения ответа от DeepSeek Chat API в режиме стриминга.
+    Асинхронный генератор для получения ответа от XAI Chat API в режиме стриминга.
     """
     # Убираем системный промпт из истории, если он там уже есть
     history_no_system = [msg for msg in history if msg.get("role") != "system"]
+    # XAI ожидает системный промпт как первое сообщение в списке
     messages = [{"role": "system", "content": system_prompt}] + history_no_system
 
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
-        "Accept": "application/json" # Добавим Accept
+        "Accept": "text/event-stream" # XAI использует Server-Sent Events для стриминга
     }
-    # ИСПОЛЬЗУЕМ правильный URL для стриминга v1
-    url = "https://api.deepseek.com/v1/chat/completions"
+    # URL XAI API
+    url = "https://api.x.ai/v1/chat/completions"
     payload = {
-        "model": "deepseek-chat", # Убедитесь, что эта модель поддерживает стриминг
+        "model": "grok-3-mini-beta",
         "messages": messages,
         "stream": True,
-        "max_tokens": 4000,
-        "temperature": 0.7, # Можно настроить
-        # Другие параметры при необходимости: top_p, frequency_penalty, presence_penalty
+        "temperature": 0.3,
+        "reasoning": {"effort": "high"},
     }
+    # Таймаут для запроса (в секундах)
+    request_timeout = 180 # 3 минуты
+
+    # Ограничение на количество попыток подключения
+    max_retries = 3
+    retry_delay = 1 # секунда
+
+    # Используем сессию aiohttp для управления соединениями
     connector = aiohttp.TCPConnector(family=socket.AF_INET) # Используем IPv4
+    async with aiohttp.ClientSession(connector=connector) as session:
+        for attempt in range(max_retries):
+            try:
+                # Выполняем POST-запрос с указанным таймаутом
+                async with session.post(url, headers=headers, json=payload, timeout=request_timeout) as response:
+                    response.raise_for_status()  # Вызовет исключение для статусов 4xx/5xx
 
-    try:
-        # Используем общий таймаут None для стриминга, но с connect/sock_read таймаутами
-        timeout = aiohttp.ClientTimeout(total=None, connect=15, sock_connect=15, sock_read=120)
-        async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-            async with session.post(url, headers=headers, json=payload) as response:
-                if response.status != 200:
-                    error_text = await response.text()
-                    logger.error(f"Ошибка HTTP запроса к DeepSeek API: {response.status}. Ответ: {error_text[:500]}")
-                    # Можно выбросить исключение или вернуть пустой генератор
-                    response.raise_for_status() # Это выбросит ClientResponseError
+                    buffer = ""  # Буфер для неполных данных
+                    # Читаем ответ построчно (SSE)
+                    async for line_bytes in response.content:
+                        line = line_bytes.decode('utf-8').strip()
+                        logger.debug(f"Received line: {line!r}")
 
-                async for line in response.content:
-                    line_str = line.decode('utf-8').strip()
-                    # logger.debug(f"Raw line: {line_str!r}") # Для отладки
+                        if not line:
+                            continue
 
-                    if not line_str:
-                        continue # Пропускаем пустые строки
+                        if line.startswith("data: "):
+                            buffer = line[len("data: "):]
+                            if buffer == "[DONE]":
+                                logger.info("Стриминг завершен сигналом [DONE]")
+                                return
+                            try:
+                                chunk = json.loads(buffer)
+                                choices = chunk.get('choices') or []
+                                if choices:
+                                    delta = choices[0].get('delta') or {}
+                                    text = delta.get('content')
+                                    if text:
+                                        yield text
+                                finish_reason = choices[0].get('finish_reason')
+                                if finish_reason:
+                                    logger.info(f"Стриминг завершен с причиной: {finish_reason}")
+                            except json.JSONDecodeError:
+                                logger.error(f"Ошибка декодирования JSON из строки: {buffer!r}")
+                            except Exception as e:
+                                logger.exception(f"Неожиданная ошибка при обработке чанка JSON: {e}. Чанк: {buffer}")
+                            continue
 
-                    if line_str.startswith("data: "):
-                        payload_str = line_str[len("data: "):].strip()
-                    else:
-                        # Иногда первая или последняя строка может не иметь префикса
-                        payload_str = line_str
-
-                    if payload_str == "[DONE]":
-                        logger.info("Стриминг завершен ([DONE])")
-                        break
-
+            except asyncio.TimeoutError:
+                logger.error(f"Таймаут при подключении/чтении из XAI API (попытка {attempt + 1}/{max_retries}). URL: {url}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(retry_delay * (attempt + 1)) # Экспоненциальная задержка
+                    continue
+                else:
+                    raise # Перебрасываем исключение после последней попытки
+            except aiohttp.ClientConnectionError as e:
+                 logger.error(f"Ошибка соединения с XAI API: {e}. URL: {url}. Попытка {attempt + 1}/{max_retries}.")
+                 if attempt < max_retries - 1:
+                      await asyncio.sleep(retry_delay * (attempt + 1))
+                      continue
+                 else:
+                      raise
+            except aiohttp.ClientResponseError as e:
+                # Пробрасываем авторизационные ошибки (401/403) для обработки выше
+                if e.status in (401, 403):
+                    raise
+                # Логируем и повторяем только серверные ошибки 5xx
+                if e.status >= 500 and attempt < max_retries - 1:
                     try:
-                        chunk = json.loads(payload_str)
-                        choices = chunk.get('choices')
-                        if choices and isinstance(choices, list) and len(choices) > 0:
-                            delta = choices[0].get('delta')
-                            if delta and isinstance(delta, dict):
-                                delta_content = delta.get('content')
-                                if delta_content and isinstance(delta_content, str):
-                                    # logger.debug(f"Chunk content: {delta_content!r}")
-                                    yield delta_content
-                            # Проверяем finish_reason для завершения
-                            finish_reason = choices[0].get('finish_reason')
-                            if finish_reason:
-                                logger.info(f"Стриминг завершен с причиной: {finish_reason}")
-                                break # Выход из цикла, так как генерация закончена
+                        error_body = await response.text()
+                    except Exception:
+                        error_body = ""
+                    logger.error(f"Ошибка HTTP запроса к XAI API: {e.status} {e.message}. URL: {url}. Попытка {attempt + 1}/{max_retries}. Тело ответа: {error_body[:500]}")
+                    await asyncio.sleep(retry_delay * (attempt + 1))
+                    continue
+                # Для остальных клиентских ошибок прекращаем ретраи
+                raise
+            else:
+                 # Если запрос успешен, выходим из цикла ретраев
+                 break
 
-                    except json.JSONDecodeError:
-                        logger.error(f"Ошибка декодирования JSON из строки: {payload_str!r}")
-                        continue
-                    except Exception as e:
-                        logger.error(f"Неожиданная ошибка при обработке чанка JSON: {e}. Чанк: {chunk}")
-                        continue
 
-    except aiohttp.ClientResponseError as e:
-        logger.error(f"Ошибка HTTP запроса к DeepSeek API: {e.status} {e.message}. URL: {url}")
-    except asyncio.TimeoutError:
-        logger.error("Таймаут при подключении/чтении из DeepSeek API.")
-    except aiohttp.ClientError as e:
-        # Улучшенное логирование сетевой ошибки
-        logger.error(f"Ошибка сети при запросе к DeepSeek API: {e}. URL: {url}")
-    except Exception as e:
-        logger.exception(f"Непредвиденная ошибка в stream_deepseek_response: {e}")
-    # Генератор просто завершится в случае ошибки
-
-# --- Новая функция форматирования Markdown в HTML ---
-
+# --- Обработка Markdown в HTML для Telegram ---
 def markdown_to_telegram_html(text: str) -> str:
-    """
-    Преобразует базовый Markdown в HTML, поддерживаемый Telegram.
-    Экранирует специальные символы HTML.
-    Обрабатывает блоки кода, inline код и LaTeX-подобные математические выражения.
-    Использует безопасные плейсхолдеры, чтобы избежать конфликтов с Markdown.
-    """
+    """Преобразует Markdown-подобный текст в HTML, поддерживаемый Telegram."""
+    import re, html
+
     if not text:
         return ""
 
-    # 1. Экранирование базовых HTML символов ВЕЗДЕ
-    text = html.escape(text)
+    code_blocks: dict[str, str] = {}
+    placeholder_counter = 0
 
-    # Плейсхолдеры для замены
-    code_blocks = []
-    inline_codes = []
-    math_codes = []
-
-    # 2. Обработка блоков кода ``` ``` -> <pre>...</pre>
-    def _replace_code_block(match):
-        lang = match.group(1) or ""
-        code = match.group(2)
-        pre_tag = '<pre>'
-        placeholder = f"@@CODEBLOCK_{len(code_blocks)}@@"
-        code_blocks.append((placeholder, f"{pre_tag}{code}</pre>"))
+    def _extract_code_block(match):
+        nonlocal placeholder_counter
+        placeholder = f"@@CODEBLOCK_{placeholder_counter}@@"
+        code_blocks[placeholder] = match.group(1)
+        placeholder_counter += 1
         return placeholder
-    text = re.sub(r"```(\w*)\n?(.*?)\n?```", _replace_code_block, text, flags=re.DOTALL | re.MULTILINE)
 
-    # 3. Обработка inline кода ` ` -> <code>...</code>
-    def _replace_inline_code(match):
-        code = match.group(1)
-        placeholder = f"@@INLINECODE_{len(inline_codes)}@@"
-        inline_codes.append((placeholder, f"<code>{code}</code>"))
+    def _extract_inline_code(match):
+        nonlocal placeholder_counter
+        placeholder = f"@@INLINECODE_{placeholder_counter}@@"
+        code_blocks[placeholder] = match.group(1)
+        placeholder_counter += 1
         return placeholder
-    text = re.sub(r"`(.+?)`", _replace_inline_code, text)
 
-    # 3.5 Обработка LaTeX math \\[ ... \\] и \\( ... \\) -> <code>...</code>
-    def _replace_math_code(match):
-        math_content = match.group(1)
+    # Извлечение блоков кода
+    text = re.sub(r"```(?:\w+)?\n([\s\S]*?)```", _extract_code_block, text, flags=re.DOTALL)
+    # Извлечение inline-кода
+    text = re.sub(r"`([^`]+?)`", _extract_inline_code, text)
 
-        # Преобразуем базовые LaTeX команды в псевдо-текст
-        # Сначала \text{...}
-        math_content = re.sub(r"\\text{(.*?)}", r"\1", math_content)
-        # Затем \frac{...}{...}
-        math_content = re.sub(r"\\frac{(.*?)}{(.*?)}", r"(\1 / \2)", math_content)
-        # Затем \,
-        math_content = math_content.replace(r",", " ")
+    # Экранирование остального текста
+    text = html.escape(text, quote=False)
 
-        placeholder = f"@@MATH_{len(math_codes)}@@"
-        # Оборачиваем ПРЕОБРАЗОВАННОЕ содержимое в <code>
-        math_codes.append((placeholder, f"<code>{math_content}</code>"))
-        return placeholder
-    # Сначала блочные \\[ ... \\], затем инлайновые \\( ... \\)
-    text = re.sub(r"\\\[(.*?)\\]", _replace_math_code, text, flags=re.DOTALL)
-    text = re.sub(r"\\((.*?)\\)", _replace_math_code, text)
-
-    # 4. Обработка жирного текста **text** -> <b>text</b>
-    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
-    # Обработка жирного текста __text__ -> <b>text</b> (ПОСЛЕ замены плейсхолдеров)
-    text = re.sub(r"__(.+?)__", r"<b>\1</b>", text)
-
-    # 5. Обработка курсива *text* -> <i>text</i> (после жирного)
-    text = re.sub(r"\*(.+?)\*", r"<i>\1</i>", text)
-    # Обработка курсива _text_ -> <i>text</i> (после жирного)
-    text = re.sub(r"_(.+?)_", r"<i>\1</i>", text)
-
-    # 6. Обработка зачеркнутого ~~text~~ -> <s>text</s>
-    text = re.sub(r"~~(.+?)~~", r"<s>\1</s>", text)
-
-    # 7. Обработка заголовков #### text -> <b>text</b> (простой вариант)
-    text = re.sub(r"^\s*#{1,6}\s+(.+)$", r"<b>\1</b>", text, flags=re.MULTILINE)
-
-    # 8. Обработка ссылок [text](url) -> <a href="url">text</a>
+    # Ссылки [text](url)
     def _replace_link(match):
-        link_text = match.group(1)
+        label = match.group(1)
         url = match.group(2)
-        url_unescaped = html.unescape(url)
-        safe_url = url_unescaped.replace('"', '%22').replace("'", '%27')
-        return f'<a href="{safe_url}">{link_text}</a>'
-    text = re.sub(r"\[(.+?)\]\((.+?)\)", _replace_link, text)
+        safe_url = html.escape(url, quote=True)
+        return f'<a href="{safe_url}">{label}</a>'
+    text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", _replace_link, text)
 
-    # 9-11. Восстановление блоков в обратном порядке (чтобы индексы не сбивались, если плейсхолдеры вложены)
-    # Сначала самые внутренние (math, inline), потом внешние (code blocks)
-    for placeholder, replacement in reversed(math_codes):
-        text = text.replace(placeholder, replacement)
-    for placeholder, replacement in reversed(inline_codes):
-        text = text.replace(placeholder, replacement)
-    for placeholder, replacement in reversed(code_blocks):
+    # Заголовки #…##
+    text = re.sub(r"^(#{1,6})\s*(.+)$", lambda m: f"<b>{m.group(2)}</b>\n", text, flags=re.MULTILINE)
+
+    # Жирный **text**
+    text = re.sub(r"\*\*([^\*]+)\*\*", r"<b>\1</b>", text)
+    # Подчёркивание __text__
+    text = re.sub(r"__([^_]+)__", r"<u>\1</u>", text)
+    # Курсив *text* и _text_
+    text = re.sub(r"(?<!\*)\*([^*]+)\*(?!\*)", r"<i>\1</i>", text)
+    text = re.sub(r"(?<!_)_([^_]+)_(?!_)", r"<i>\1</i>", text)
+    # Зачёркивание ~~text~~
+    text = re.sub(r"~~(.+?)~~", r"<s>\1</s>", text)
+    # Спойлеры ||text||
+    text = re.sub(r"\|\|(.+?)\|\|", r"<tg-spoiler>\1</tg-spoiler>", text)
+
+    # Восстановление кодовых блоков
+    for placeholder, code in code_blocks.items():
+        escaped = html.escape(code, quote=False)
+        if placeholder.startswith("@@CODEBLOCK_"):
+            replacement = f"<pre>{escaped}</pre>"
+        else:
+            replacement = f"<code>{escaped}</code>"
         text = text.replace(placeholder, replacement)
 
-    return text.strip()
+    # Нормализация пустых строк (не более двух подряд)
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    # Удаляем пробелы и переносы в начале/конце
+    text = text.strip()
+
+    return text
+
+# --- Вспомогательная функция для разбиения текста ---
+def split_text(text: str, length: int = TELEGRAM_MAX_LENGTH) -> list[str]:
+    """Разбивает текст на части указанной длины."""
+    if len(text) <= length:
+        return [text]
+
+    chunks = []
+    start = 0
+    while start < len(text):
+        # Ищем последний перенос строки или пробел в пределах длины
+        end = start + length
+        if end >= len(text):
+            chunks.append(text[start:])
+            break
+
+        split_pos = -1
+        # Ищем с конца к началу чанка
+        for i in range(end - 1, start -1, -1):
+            if text[i] == '\n':
+                split_pos = i + 1 # Включаем перенос в предыдущий чанк
+                break
+            elif text[i] == ' ':
+                split_pos = i + 1 # Разделяем по пробелу
+                break
+
+        if split_pos != -1 and split_pos > start: # Если нашли подходящую точку разрыва
+            chunks.append(text[start:split_pos])
+            start = split_pos
+        else: # Если не нашли (например, очень длинное слово или строка без пробелов)
+            # Просто рубим по длине
+            chunks.append(text[start:end])
+            start = end
+
+    return chunks
 
 
 # --- Обработчики Telegram ---
@@ -477,7 +534,8 @@ def markdown_to_telegram_html(text: str) -> str:
 @dp.message(Command("start"))
 async def start_handler(message: types.Message):
     builder = InlineKeyboardBuilder()
-    builder.button(text="Очистить историю", callback_data="clear_history")
+    # Используем final_keyboard для консистентности
+    builder.button(text="🔄 Очистить историю", callback_data="clear_history")
     await message.answer("Привет! Я ваш AI ассистент. Задайте ваш вопрос.", reply_markup=builder.as_markup())
 
 @dp.message(F.text)
@@ -485,6 +543,14 @@ async def message_handler(message: types.Message):
     user_id = message.from_user.id
     chat_id = message.chat.id
     user_text = message.text
+
+    # Проверка, не идет ли уже генерация для этого пользователя
+    if user_id in active_requests:
+        try:
+            await message.reply("Пожалуйста, дождитесь завершения предыдущего запроса или отмените его.", reply_markup=progress_keyboard(user_id))
+        except TelegramAPIError as e:
+            logger.warning(f"Не удалось отправить сообщение о дублирующем запросе: {e}")
+        return
 
     # Получаем зависимости из workflow_data
     db = dp.workflow_data.get('db')
@@ -507,28 +573,24 @@ async def message_handler(message: types.Message):
         history = await get_last_messages(db, user_id, limit=CONVERSATION_HISTORY_LIMIT)
         logger.info(f"Получена история сообщений для пользователя {user_id}, записей: {len(history)}")
 
-        # Инициализация переменных для стриминга
+        # Инициализация переменных для стриминга из старой версии
         full_raw_response = ""      # Полный сырой ответ от модели для БД и разбиения
         current_message_id = None   # ID текущего редактируемого сообщения
         last_edit_time = 0          # Время последнего редактирования (используем time.monotonic)
         edit_interval = 1.5         # Интервал троттлинга (секунды) - можно увеличить
-        placeholder_sent = False    # Флаг, отправлен ли плейсхолдер
-        initial_message_sent = False # Флаг, отправлено ли первое сообщение (плейсхолдер или часть ответа)
         formatting_failed = False   # Флаг, если HTML парсинг вызвал ошибку
 
-        # Отправка начального сообщения-плейсхолдера
+        # Отправка начального сообщения-плейсхолдера из старой версии
         try:
             placeholder_message = await message.answer("⏳ Генерирую ответ...")
             current_message_id = placeholder_message.message_id
-            initial_message_sent = True
             last_edit_time = time.monotonic()
         except TelegramAPIError as e:
             logger.error(f"Ошибка отправки плейсхолдера: {e}")
-            # Не можем продолжить без начального сообщения
-            return
+            return # Не можем продолжить без начального сообщения
 
-        # Стрим ответа от DeepSeek API
-        async for chunk in stream_deepseek_response(current_settings.DEEPSEEK_API_KEY, SYSTEM_PROMPT, history):
+        # Старый цикл стриминга, адаптированный под stream_xai_response
+        async for chunk in stream_xai_response(current_settings.XAI_API_KEY, SYSTEM_PROMPT, history):
             full_raw_response += chunk
             now = time.monotonic()
 
@@ -543,9 +605,8 @@ async def message_handler(message: types.Message):
 
                     # Проверяем длину перед отправкой
                     if len(text_to_show) > TELEGRAM_MAX_LENGTH:
-                         # Если превышает, пока не редактируем, дождемся следующего чанка или конца
-                         logger.warning(f"Длина сообщения {len(text_to_show)} превышает лимит {TELEGRAM_MAX_LENGTH}, пропускаем редактирование.")
-                         continue # Пропустить текущее редактирование
+                        logger.warning(f"Длина сообщения {len(text_to_show)} превышает лимит {TELEGRAM_MAX_LENGTH}, пропускаем редактирование.")
+                        continue # Пропустить текущее редактирование
 
                     if not formatting_failed:
                         await bot.edit_message_text(
@@ -556,13 +617,12 @@ async def message_handler(message: types.Message):
                         )
                     else:
                         # Если форматирование ранее не удалось, отправляем сырой текст
-                         await bot.edit_message_text(
+                        await bot.edit_message_text(
                             text=full_raw_response + "...", # Сырой текст
                             chat_id=chat_id,
                             message_id=current_message_id,
                             parse_mode=None # Без форматирования
                         )
-
                     last_edit_time = now
 
                 except TelegramRetryAfter as e:
@@ -600,58 +660,104 @@ async def message_handler(message: types.Message):
         if current_message_id:
             try:
                 final_html = markdown_to_telegram_html(full_raw_response)
-                # Проверяем длину финального сообщения
-                if len(final_html) > TELEGRAM_MAX_LENGTH:
-                     logger.warning(f"Финальное сообщение ({len(final_html)} символов) слишком длинное. Отправка будет разбита (логика разбиения не реализована в финальной отправке). Отправляем начало.")
-                     # TODO: Реализовать логику разбиения финального сообщения, если это необходимо
-                     # Пока отправляем только начало
-                     final_html = final_html[:TELEGRAM_MAX_LENGTH - 10] + "... (обрезано)"
+                final_keyboard_markup = final_keyboard() # Получаем финальную клавиатуру
 
+                # Разбиение на части, если необходимо (логика из split_text)
+                message_parts = split_text(final_html, TELEGRAM_MAX_LENGTH)
 
-                if not formatting_failed:
-                     await bot.edit_message_text(
-                        text=final_html,
-                        chat_id=chat_id,
-                        message_id=current_message_id,
-                        parse_mode=ParseMode.HTML
-                    )
-                     logger.info(f"Финальный ответ (HTML) отправлен пользователю {user_id}")
+                if not message_parts: # Если после форматирования текст пустой
+                     message_parts = split_text(full_raw_response, TELEGRAM_MAX_LENGTH) # Попробуем разбить сырой текст
+                     formatting_failed = True # Считаем, что форматирование не удалось
+
+                if not message_parts: # Если и сырой текст пустой
+                    logger.warning("Финальный ответ пуст после форматирования и в сыром виде.")
+                    # Удаляем плейсхолдер или заменяем на сообщение об ошибке
+                    try:
+                        await bot.delete_message(chat_id=chat_id, message_id=current_message_id)
+                    except TelegramAPIError:
+                        try: # Попытка отредактировать, если удаление не удалось
+                            await bot.edit_message_text(
+                                text="К сожалению, не удалось сгенерировать ответ.",
+                                chat_id=chat_id,
+                                message_id=current_message_id
+                            )
+                        except TelegramAPIError:
+                            logger.error("Не удалось ни удалить, ни отредактировать плейсхолдер для пустого ответа.")
+                    current_message_id = None # Сбрасываем ID
                 else:
-                     await bot.edit_message_text(
-                        text=full_raw_response, # Сырой текст
-                        chat_id=chat_id,
-                        message_id=current_message_id,
-                        parse_mode=None
-                    )
-                     logger.info(f"Финальный ответ (RAW) отправлен пользователю {user_id} из-за предыдущих ошибок форматирования")
+                    # Редактируем первое сообщение (плейсхолдер) первой частью
+                    try:
+                        await bot.edit_message_text(
+                            text=message_parts[0],
+                            chat_id=chat_id,
+                            message_id=current_message_id,
+                            parse_mode=None if formatting_failed else ParseMode.HTML,
+                            reply_markup=final_keyboard_markup if len(message_parts) == 1 else None # Клавиатура только у последнего сообщения
+                        )
+                        logger.info(f"Финальный ответ (часть 1/{len(message_parts)}) {'RAW' if formatting_failed else 'HTML'} отправлен пользователю {user_id}")
+                    except TelegramAPIError as e:
+                        logger.error(f"Ошибка редактирования финального сообщения (часть 1): {e}. Попытка без форматирования.")
+                        try:
+                             await bot.edit_message_text(
+                                text=split_text(full_raw_response, TELEGRAM_MAX_LENGTH)[0], # Первая часть сырого текста
+                                chat_id=chat_id,
+                                message_id=current_message_id,
+                                parse_mode=None,
+                                reply_markup=final_keyboard_markup if len(message_parts) == 1 else None
+                            )
+                             formatting_failed = True # Форматирование точно не сработало
+                             logger.info(f"Финальный ответ (часть 1/{len(message_parts)}) RAW отправлен пользователю {user_id} после ошибки HTML")
+                        except TelegramAPIError as plain_final_error:
+                             logger.error(f"Ошибка редактирования финального сообщения (часть 1) даже без форматирования: {plain_final_error}")
+                             # Отправляем как новое сообщение, если редактирование не удалось
+                             try:
+                                 new_msg = await message.answer(
+                                     text=message_parts[0],
+                                     parse_mode=None if formatting_failed else ParseMode.HTML,
+                                     reply_markup=final_keyboard_markup if len(message_parts) == 1 else None
+                                 )
+                                 current_message_id = new_msg.message_id # Обновляем ID на новое сообщение
+                             except Exception as send_err:
+                                 logger.error(f"Не удалось отправить первую часть как новое сообщение: {send_err}")
+                                 current_message_id = None # Не можем продолжить
+
+
+                    # Отправляем остальные части новыми сообщениями
+                    if current_message_id: # Продолжаем, только если удалось отправить/отредактировать первую часть
+                        for i in range(1, len(message_parts)):
+                            try:
+                                await asyncio.sleep(0.1) # Небольшая пауза между сообщениями
+                                await message.answer(
+                                    text=message_parts[i],
+                                    parse_mode=None if formatting_failed else ParseMode.HTML,
+                                    reply_markup=final_keyboard_markup if i == len(message_parts) - 1 else None
+                                )
+                                logger.info(f"Финальный ответ (часть {i+1}/{len(message_parts)}) {'RAW' if formatting_failed else 'HTML'} отправлен пользователю {user_id}")
+                            except TelegramAPIError as e:
+                                logger.error(f"Ошибка отправки части {i+1} финального сообщения: {e}")
+                                # Можно попробовать отправить без форматирования или остановить отправку
+                                try:
+                                    await message.answer(
+                                        text=split_text(full_raw_response, TELEGRAM_MAX_LENGTH)[i],
+                                        parse_mode=None,
+                                        reply_markup=final_keyboard_markup if i == len(message_parts) - 1 else None
+                                    )
+                                except Exception as send_err_part:
+                                     logger.error(f"Не удалось отправить часть {i+1} даже без форматирования: {send_err_part}")
+                                     break # Прерываем отправку остальных частей
 
             except TelegramRetryAfter as e:
                 logger.warning(f"Превышен лимит запросов (RetryAfter) при отправке финального сообщения, ожидание {e.retry_after}с")
                 await asyncio.sleep(e.retry_after + 0.1)
-                # Повторная попытка (можно вынести в функцию)
-                try:
-                     if not formatting_failed:
-                          await bot.edit_message_text(text=final_html, chat_id=chat_id, message_id=current_message_id, parse_mode=ParseMode.HTML)
-                     else:
-                          await bot.edit_message_text(text=full_raw_response, chat_id=chat_id, message_id=current_message_id, parse_mode=None)
-                except Exception as final_e:
-                     logger.error(f"Повторная ошибка при отправке финального сообщения: {final_e}")
-            except TelegramAPIError as e:
-                 logger.error(f"Ошибка отправки финального сообщения с HTML: {e}. Попытка без форматирования.")
-                 try:
-                      await bot.edit_message_text(
-                         text=full_raw_response, # Сырой текст
-                         chat_id=chat_id,
-                         message_id=current_message_id,
-                         parse_mode=None
-                     )
-                      logger.info(f"Финальный ответ (RAW) отправлен пользователю {user_id} после ошибки HTML")
-                 except TelegramAPIError as plain_final_error:
-                      logger.error(f"Ошибка отправки финального сообщения даже без форматирования: {plain_final_error}")
-                      # Может быть, отправить новое сообщение?
-                      # await message.answer("Не удалось обновить предыдущее сообщение, вот ответ:\n" + full_raw_response[:TELEGRAM_MAX_LENGTH])
+                # TODO: Добавить повторную попытку отправки финального сообщения
             except Exception as e:
                 logger.exception(f"Неожиданная ошибка при отправке финального сообщения: {e}")
+                # Попытка отправить простое сообщение об ошибке, если плейсхолдер еще существует
+                if current_message_id:
+                    try:
+                        await bot.edit_message_text("Произошла ошибка при формировании финального ответа.", chat_id=chat_id, message_id=current_message_id)
+                    except TelegramAPIError:
+                         pass # Игнорировать ошибку, если не можем отредактировать
 
         # Сохраняем ПОЛНЫЙ СЫРОЙ ответ ассистента в БД
         if full_raw_response:
@@ -661,8 +767,8 @@ async def message_handler(message: types.Message):
             except Exception as e:
                 logger.error(f"Ошибка сохранения ответа ассистента в БД: {e}")
         else:
-             logger.warning(f"Не получен ответ от DeepSeek для пользователя {user_id}")
-             # Если было начальное сообщение, отредактируем его на сообщение об ошибке
+             logger.warning(f"Не получен или пустой ответ от XAI для пользователя {user_id}")
+             # Если было начальное сообщение-плейсхолдер, отредактируем его на сообщение об ошибке
              if current_message_id:
                  try:
                       await bot.edit_message_text("К сожалению, не удалось получить ответ от AI.", chat_id=chat_id, message_id=current_message_id)
@@ -672,9 +778,54 @@ async def message_handler(message: types.Message):
     except Exception as e:
         logger.exception(f"Критическая ошибка в обработчике сообщений для user_id={user_id}: {e}")
         try:
-            await message.answer("Произошла серьезная ошибка при обработке вашего запроса. Пожалуйста, попробуйте позже или используйте команду /start для сброса.")
+            # Пытаемся отредактировать плейсхолдер, если он был создан
+            if current_message_id:
+                 await bot.edit_message_text("Произошла серьезная ошибка при обработке вашего запроса.", chat_id=chat_id, message_id=current_message_id)
+            else: # Иначе отправляем новое сообщение
+                await message.answer("Произошла серьезная ошибка при обработке вашего запроса. Пожалуйста, попробуйте позже или используйте команду /start для сброса.")
         except TelegramAPIError:
              logger.error("Не удалось даже отправить сообщение об ошибке пользователю.")
+
+# --- Обработчик отмены генерации ---
+@dp.callback_query(F.data.startswith("cancel_generation_"))
+async def cancel_generation_callback(callback: types.CallbackQuery):
+    try:
+        user_id_to_cancel = int(callback.data.split("_")[-1])
+        requesting_user_id = callback.from_user.id
+
+        # Проверяем, что пользователь отменяет свой собственный запрос
+        if user_id_to_cancel != requesting_user_id:
+            await callback.answer("Вы не можете отменить чужой запрос.", show_alert=True)
+            return
+
+        task_to_cancel = active_requests.get(user_id_to_cancel)
+
+        if task_to_cancel:
+            task_to_cancel.cancel()
+            logger.info(f"Запрос на генерацию для пользователя {user_id_to_cancel} отменен пользователем.")
+            await callback.answer("Генерация ответа отменена.")
+            # Сообщение с прогрессом будет удалено в блоке finally/except CancelledError обработчика
+            # но можно и здесь попробовать удалить кнопку или отредактировать сообщение
+            try:
+                await callback.message.edit_text("Генерация ответа отменена.", reply_markup=None)
+            except TelegramAPIError as e:
+                 logger.warning(f"Не удалось отредактировать сообщение после отмены: {e}")
+
+        else:
+            logger.warning(f"Не найден активный запрос для отмены для пользователя {user_id_to_cancel}")
+            await callback.answer("Не найден активный запрос для отмены.", show_alert=True)
+            # Убираем клавиатуру, если запроса уже нет
+            try:
+                await callback.message.edit_reply_markup(reply_markup=None)
+            except TelegramAPIError:
+                pass # Игнорируем ошибку, если не можем изменить
+
+    except ValueError:
+        logger.error(f"Ошибка парсинга user_id из callback_data: {callback.data}")
+        await callback.answer("Ошибка обработки запроса.", show_alert=True)
+    except Exception as e:
+        logger.exception(f"Ошибка в cancel_generation_callback: {e}")
+        await callback.answer("Произошла ошибка при отмене.", show_alert=True)
 
 
 @dp.callback_query(F.data == "clear_history")
@@ -706,23 +857,30 @@ async def clear_history_callback(callback: types.CallbackQuery):
         else:
             # PostgreSQL
             async with db.acquire() as connection: # db здесь это пул
-                result = await connection.execute("DELETE FROM conversations WHERE user_id = $1 RETURNING id", user_id)
+                result = await connection.execute("DELETE FROM conversations WHERE user_id = $1", user_id) # Убрал RETURNING id для простоты
                 # result это строка вида "DELETE N", парсим N
                 try:
-                    rows_deleted_count = int(result.split()[-1]) if result else 0
+                    rows_deleted_count = int(result.split()[-1]) if result.startswith("DELETE") else 0
                 except:
                     rows_deleted_count = -1 # Не удалось распарсить
                 logger.info(f"PostgreSQL: Очищена история пользователя {user_id}, результат: {result}")
 
         await callback.answer(f"История очищена ({rows_deleted_count} записей удалено)", show_alert=False)
         # Можно добавить сообщение в чат для наглядности
-        await callback.message.edit_text("История диалога очищена.") # Редактируем исходное сообщение
-        # Или отправить новое
-        # await callback.message.answer("История диалога очищена.")
+        # Редактируем исходное сообщение или отвечаем новым
+        try:
+            # Пытаемся отредактировать, если это было сообщение с кнопкой
+            await callback.message.edit_text("История диалога очищена.", reply_markup=None)
+        except TelegramAPIError:
+            # Если не вышло (например, это было не сообщение бота или прошло много времени),
+            # отправляем новое сообщение
+             await callback.message.answer("История диалога очищена.")
+
     except Exception as e:
         logger.exception(f"Ошибка при очистке истории (callback) для user_id={user_id}: {e}")
         await callback.answer("Произошла ошибка при очистке", show_alert=True)
 
+# --- Обработчик команды /clear ---
 @dp.message(Command("clear"))
 async def clear_command_handler(message: types.Message):
     user_id = message.from_user.id
@@ -753,7 +911,7 @@ async def clear_command_handler(message: types.Message):
             async with db.acquire() as connection:
                 result = await connection.execute("DELETE FROM conversations WHERE user_id = $1", user_id)
                 try:
-                    rows_deleted_count = int(result.split()[-1]) if result else 0
+                     rows_deleted_count = int(result.split()[-1]) if result.startswith("DELETE") else 0
                 except:
                     rows_deleted_count = -1
                 logger.info(f"PostgreSQL: Очищена история пользователя {user_id} по команде /clear, результат: {result}")
@@ -798,29 +956,23 @@ async def document_handler(message: types.Message):
 
 # --- Функции запуска и остановки ---
 
-# Исправляем сигнатуру on_shutdown и получаем зависимости из kwargs
+# Восстанавливаем функцию on_shutdown
 async def on_shutdown(**kwargs):
     logger.info("Завершение работы бота...")
     # Получаем dp и из него workflow_data
     dp_local = kwargs.get('dispatcher') # aiogram передает dispatcher
     if not dp_local:
         logger.error("Не удалось получить dispatcher в on_shutdown")
-        # Попытка получить из глобальной области видимости (менее надежно)
-        # from __main__ import dp as dp_global
-        # dp_local = dp_global
-        # if not dp_local:
-        #      logger.error("Не удалось получить dispatcher и из глобальной области")
-        #      return # Выходим, если не нашли dp
         return
 
     db = dp_local.workflow_data.get('db')
-    settings_local = dp_local.workflow_data.get('settings') # Используем другое имя переменной
+    settings_local = dp_local.workflow_data.get('settings')
 
     if db and settings_local:
         if not settings_local.USE_SQLITE:
             try:
                 # db здесь это пул соединений asyncpg
-                if isinstance(db, asyncpg.Pool): # Проверка типа
+                if isinstance(db, asyncpg.Pool):
                     await db.close()
                     logger.info("Пул соединений PostgreSQL успешно закрыт")
                 else:
@@ -832,13 +984,23 @@ async def on_shutdown(**kwargs):
     else:
          logger.warning("Не удалось получить 'db' или 'settings' из workflow_data при завершении работы.")
 
-    # Дополнительная обработка ошибок, если необходимо
-    # except Exception as e:
-    #     logger.exception(f"Критическая ошибка при завершении работы бота: {e}")
-
     logger.info("Бот остановлен.")
 
 
+# --- Установка команд бота (если еще не сделано) ---
+async def set_bot_commands(bot_instance: Bot):
+    commands = [
+        types.BotCommand(command="/start", description="Начать диалог / Показать меню"),
+        types.BotCommand(command="/clear", description="Очистить историю диалога"),
+        # Добавьте другие команды если нужно
+    ]
+    try:
+        await bot_instance.set_my_commands(commands)
+        logger.info("Команды бота успешно установлены.")
+    except TelegramAPIError as e:
+        logger.error(f"Ошибка при установке команд бота: {e}")
+
+# --- Главная функция запуска ---
 async def main():
     logger.info(f"Запуск приложения с настройками базы данных: {settings.DATABASE_URL}")
     db_connection = None # Переименуем, чтобы не конфликтовать с именем модуля
@@ -875,8 +1037,8 @@ async def main():
             except asyncpg.exceptions.InvalidPasswordError:
                  logger.error("Ошибка аутентификации PostgreSQL: неверный пароль.")
                  sys.exit(1)
-            except asyncpg.exceptions.InvalidCatalogNameError:
-                 logger.error(f"Ошибка PostgreSQL: база данных '{settings.DB_NAME or 'указанная в URL'}' не найдена.")
+            except asyncpg.exceptions.InvalidCatalogNameError as e: # Добавляем обработку InvalidCatalogNameError
+                 logger.error(f"Ошибка PostgreSQL: база данных, указанная в URL, не найдена. {e}")
                  sys.exit(1)
             except asyncpg.PostgresError as e:
                 logger.error(f"Общая ошибка PostgreSQL при подключении/инициализации: {e}")
@@ -894,6 +1056,9 @@ async def main():
         dp.shutdown.register(on_shutdown)
         logger.info("Обработчик shutdown зарегистрирован")
 
+        # Установка команд бота - помещаем здесь, в конце блока try
+        await set_bot_commands(bot)
+
     except Exception as e:
         logger.exception(f"Критическая ошибка при инициализации бота: {e}")
         sys.exit(1)
@@ -909,5 +1074,38 @@ async def main():
         await bot.session.close()
         logger.info("Сессия бота закрыта.")
 
+# Отдельная асинхронная функция для очистки задач
+async def cleanup_tasks():
+    tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+    if tasks:
+        logger.info(f"Ожидание завершения {len(tasks)} фоновых задач...")
+        [task.cancel() for task in tasks]
+        try:
+            await asyncio.gather(*tasks, return_exceptions=True)
+            logger.info("Фоновые задачи завершены.")
+        except asyncio.CancelledError:
+             logger.info("Задачи были отменены во время завершения.")
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+         logger.info("Получен сигнал KeyboardInterrupt, завершаю работу...")
+    except SystemExit:
+         logger.info("Получен сигнал SystemExit, завершаю работу...")
+    finally:
+        # Вызываем асинхронную очистку через asyncio.run
+        logger.info("Запуск очистки фоновых задач...")
+        try:
+            asyncio.run(cleanup_tasks())
+        except RuntimeError as e:
+            # Избегаем ошибки "Cannot run the event loop while another loop is running"
+            # если loop уже остановлен или используется в другом месте
+            if "Cannot run the event loop" in str(e):
+                 logger.warning("Не удалось запустить cleanup_tasks: цикл событий уже остановлен или занят.")
+            else:
+                 logger.exception("Ошибка во время выполнения cleanup_tasks.")
+        except Exception as e:
+            logger.exception("Непредвиденная ошибка во время выполнения cleanup_tasks.")
+
+        logger.info("Процесс завершен.")
