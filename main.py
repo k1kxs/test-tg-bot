@@ -1,7 +1,7 @@
 import asyncio
 import logging
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command, CommandObject, StateFilter
+from aiogram.filters import Command, CommandObject, StateFilter, BaseFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.utils.keyboard import InlineKeyboardBuilder, InlineKeyboardButton
@@ -145,6 +145,18 @@ bot = Bot(token=settings.TELEGRAM_BOT_TOKEN, default=DefaultBotProperties(parse_
 progress_message_ids: dict[int, int] = {} # {user_id: message_id}
 active_requests: dict[int, asyncio.Task] = {} # {user_id: task}
 
+# --- Фильтр для проверки администратора ---
+class IsAdmin(BaseFilter):
+    """Фильтр, пропускающий только администраторов (поле is_admin в БД)."""
+    async def __call__(self, message: types.Message) -> bool:  # noqa: D401
+        db = dp.workflow_data.get('db')
+        if not db:
+            return False
+        user = await get_user(db, message.from_user.id)
+        return bool(user and user.get('is_admin', False))
+
+# --- Конец фильтра IsAdmin ---
+
 # --- Функции для создания клавиатур ---
 def progress_keyboard(user_id: int) -> types.InlineKeyboardMarkup:
     """Создает клавиатуру с кнопкой отмены генерации."""
@@ -215,7 +227,7 @@ async def init_sqlite_db(db_path):
                     last_name TEXT NULL,
                     registration_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     last_active_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    free_messages_today INTEGER DEFAULT 3,
+                    free_messages_today INTEGER DEFAULT 7,
                     last_free_reset_date TEXT DEFAULT (date('now')), -- Используем TEXT для даты в SQLite
                     subscription_status TEXT DEFAULT 'inactive' CHECK (subscription_status IN ('inactive', 'active')),
                     subscription_expires TIMESTAMP NULL,
@@ -258,7 +270,7 @@ async def init_db_postgres(pool: asyncpg.Pool):
                         last_name TEXT NULL,
                         registration_date TIMESTAMPTZ DEFAULT NOW(),
                         last_active_date TIMESTAMPTZ DEFAULT NOW(),
-                        free_messages_today INTEGER DEFAULT 3,
+                        free_messages_today INTEGER DEFAULT 7,
                         last_free_reset_date DATE DEFAULT CURRENT_DATE,
                         subscription_status TEXT DEFAULT 'inactive' CHECK (subscription_status IN ('inactive', 'active')),
                         subscription_expires TIMESTAMPTZ NULL,
@@ -432,8 +444,10 @@ async def add_user_sqlite(db_path: str, user_id: int, username: str | None, firs
             cursor = conn.cursor()
             cursor.execute(
                 """
-                INSERT INTO users (user_id, username, first_name, last_name, last_active_date, last_free_reset_date)
-                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, date('now'))
+                INSERT INTO users (
+                    user_id, username, first_name, last_name,
+                    last_active_date, last_free_reset_date, free_messages_today
+                ) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, date('now'), 7)
                 ON CONFLICT(user_id) DO NOTHING -- Игнорировать, если пользователь уже есть
                 """,
                 (user_id, username, first_name, last_name)
@@ -453,8 +467,10 @@ async def add_user_postgres(pool: asyncpg.Pool, user_id: int, username: str | No
         async with pool.acquire() as conn:
             await conn.execute(
                 """
-                INSERT INTO users (user_id, username, first_name, last_name, last_active_date, last_free_reset_date)
-                VALUES ($1, $2, $3, $4, NOW(), CURRENT_DATE)
+                INSERT INTO users (
+                    user_id, username, first_name, last_name,
+                    last_active_date, last_free_reset_date, free_messages_today
+                ) VALUES ($1, $2, $3, $4, NOW(), CURRENT_DATE, 7)
                 ON CONFLICT (user_id) DO NOTHING -- Игнорировать, если пользователь уже есть
                 """,
                 user_id, username, first_name, last_name
@@ -483,6 +499,108 @@ async def update_user_last_active(db, user_id: int):
     except Exception as e:
         logger.exception(f"Ошибка обновления last_active_date для user_id={user_id}: {e}")
 
+# --- Вспомогательные функции для управления лимитами и подпиской ---
+async def update_user_limits(db, user_id: int, free_messages_today: int, last_free_reset_date: datetime.date | None = None):
+    """Обновляет счетчик бесплатных сообщений и дату сброса."""
+    if settings.USE_SQLITE:
+        def _update():
+            conn = sqlite3.connect(db)
+            cursor = conn.cursor()
+            if last_free_reset_date:
+                cursor.execute(
+                    "UPDATE users SET free_messages_today = ?, last_free_reset_date = ? WHERE user_id = ?",
+                    (free_messages_today, last_free_reset_date.isoformat(), user_id)
+                )
+            else:
+                cursor.execute(
+                    "UPDATE users SET free_messages_today = ? WHERE user_id = ?",
+                    (free_messages_today, user_id)
+                )
+            conn.commit()
+            conn.close()
+        await asyncio.to_thread(_update)
+    else:
+        async with db.acquire() as conn:
+            if last_free_reset_date:
+                await conn.execute(
+                    "UPDATE users SET free_messages_today = $1, last_free_reset_date = $2 WHERE user_id = $3",
+                    free_messages_today, last_free_reset_date, user_id
+                )
+            else:
+                await conn.execute(
+                    "UPDATE users SET free_messages_today = $1 WHERE user_id = $2",
+                    free_messages_today, user_id
+                )
+
+async def deactivate_subscription(db, user_id: int):
+    """Деактивирует подписку пользователя."""
+    if settings.USE_SQLITE:
+        def _deact():
+            conn = sqlite3.connect(db)
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE users SET subscription_status = 'inactive', subscription_expires = NULL WHERE user_id = ?",
+                (user_id,)
+            )
+            conn.commit()
+            conn.close()
+        await asyncio.to_thread(_deact)
+    else:
+        async with db.acquire() as conn:
+            await conn.execute(
+                "UPDATE users SET subscription_status = 'inactive', subscription_expires = NULL WHERE user_id = $1",
+                user_id
+            )
+
+async def check_and_consume_limit(db, settings: Settings, user_id: int) -> bool:
+    """Проверяет подписку и ежедневный лимит, списывает запросы при необходимости."""
+    user_data = await get_user(db, user_id)
+    if not user_data:
+        logger.error(f"Не найдены данные для пользователя {user_id} при проверке лимита.")
+        return False
+    # --- НАЧАЛО ИЗМЕНЕНИЙ: ПРОВЕРКА АДМИНА ---
+    if user_data.get('is_admin', False):
+        logger.info(f"Пользователь {user_id} является администратором. Лимит не применяется.")
+        return True
+    # --- КОНЕЦ ИЗМЕНЕНИЙ ---
+    now = datetime.datetime.now(datetime.timezone.utc)
+    today = now.date()
+    # 1. Проверка подписки
+    is_sub = False
+    if user_data.get('subscription_status') == 'active':
+        sub_exp = user_data.get('subscription_expires')
+        if isinstance(sub_exp, datetime.datetime):
+            if sub_exp.tzinfo is None:
+                sub_exp = sub_exp.replace(tzinfo=datetime.timezone.utc)
+            if sub_exp > now:
+                is_sub = True
+            else:
+                logger.info(f"Подписка пользователя {user_id} истекла {sub_exp}, деактивируем.")
+                await deactivate_subscription(db, user_id)
+                user_data['subscription_status'] = 'inactive'
+        else:
+            logger.warning(f"Некорректный формат subscription_expires для user_id={user_id}")
+    if is_sub:
+        return True
+    # 2. Проверка и сброс дневного лимита
+    raw_date = user_data.get('last_free_reset_date')
+    last_date = None
+    if isinstance(raw_date, datetime.date):
+        last_date = raw_date
+    elif isinstance(raw_date, str):
+        try:
+            last_date = datetime.date.fromisoformat(raw_date)
+        except (ValueError, TypeError):
+            last_date = today - datetime.timedelta(days=1)
+    limit = user_data.get('free_messages_today', 0)
+    if last_date is None or last_date < today:
+        limit = 7
+        await update_user_limits(db, user_id, limit, today)
+    # 3. Списание или отказ
+    if limit > 0:
+        await update_user_limits(db, user_id, limit - 1)
+        return True
+    return False
 
 # --- Добавьте другие функции обновления по мере необходимости ---
 # Например, для обновления лимитов, статуса подписки и т.д.
@@ -647,7 +765,7 @@ def markdown_to_telegram_html(text: str) -> str:
     text = re.sub(r"(?<!\*)\*([^*]+)\*(?!\*)", r"<i>\1</i>", text)
     text = re.sub(r"(?<!_)_([^_]+)_(?!_)", r"<i>\1</i>", text)
     # Зачёркивание ~~text~~
-    text = re.sub(r"~~(.+?)~~", r"<s>\1</s>", text)
+    text = re.sub(r"~~(.+?)~~", r" \1⁠ ", text)
     # Спойлеры ||text||
     text = re.sub(r"\|\|(.+?)\|\|", r"<tg-spoiler>\1</tg-spoiler>", text)
 
@@ -664,6 +782,9 @@ def markdown_to_telegram_html(text: str) -> str:
     text = re.sub(r'\n{3,}', '\n\n', text)
     # Удаляем пробелы и переносы в начале/конце
     text = text.strip()
+
+    # Удаление оставшихся маркеров Markdown (*, _, ~), чтобы избежать разрывов слов и видимых символов разметки
+    text = re.sub(r'[\*_~]', '', text)
 
     return text
 
@@ -742,6 +863,7 @@ async def start_handler(message: types.Message):
 
 @dp.message(
     F.text
+    & ~F.text.startswith('/')  # исключаем команды бота
     & ~(F.text == "🔄 Новый диалог")
     & ~(F.text == "📊 Мои лимиты")
     & ~(F.text == "💎 Подписка")
@@ -800,6 +922,17 @@ async def message_handler(message: types.Message):
         # Получаем историю сообщений
         history = await get_last_messages(db, user_id, limit=CONVERSATION_HISTORY_LIMIT)
         logger.info(f"Получена история сообщений для пользователя {user_id}, записей: {len(history)}")
+
+        # Проверка лимита и подписки
+        is_allowed = await check_and_consume_limit(db, current_settings, user_id)
+        if not is_allowed:
+            kb = InlineKeyboardBuilder()
+            kb.button(text="💎 Оформить подписку", callback_data="subscribe_info")
+            await message.reply(
+                "У вас закончились бесплатные запросы на сегодня 😔\nЧтобы продолжить без ограничений, оформите подписку.",
+                reply_markup=kb.as_markup()
+            )
+            return
 
         # --- Новая логика стриминга с авто-разбиением ---
         full_raw_response = ""
@@ -1019,10 +1152,33 @@ async def cancel_generation_callback(callback: types.CallbackQuery):
         await callback.answer("Ошибка обработки отмены.", show_alert=True)
         return
 
-    # Отменяем задачу генерации, если она есть
+    # Прекращаем задачу генерации и восстанавливаем лимит, если была
     task = active_requests.pop(user_id_to_cancel, None)
     if task:
         task.cancel()
+        db = dp.workflow_data.get('db')
+        settings_local = dp.workflow_data.get('settings')
+        if db and settings_local:
+            try:
+                if settings_local.USE_SQLITE:
+                    def _restore():
+                        conn = sqlite3.connect(db)
+                        cursor = conn.cursor()
+                        cursor.execute(
+                            "UPDATE users SET free_messages_today = free_messages_today + 1 WHERE user_id = ?",
+                            (user_id_to_cancel,)
+                        )
+                        conn.commit()
+                        conn.close()
+                    await asyncio.to_thread(_restore)
+                else:
+                    async with db.acquire() as conn:
+                        await conn.execute(
+                            "UPDATE users SET free_messages_today = free_messages_today + 1 WHERE user_id = $1",
+                            user_id_to_cancel
+                        )
+            except Exception:
+                logger.exception(f"Не удалось восстановить лимит для user_id={user_id_to_cancel}")
 
     # Убираем inline-клавиатуру отмены
     try:
@@ -1166,258 +1322,90 @@ async def clear_command_handler(message: types.Message):
 @dp.message(F.photo)
 async def photo_handler(message: types.Message):
     user_id = message.from_user.id
-    chat_id = message.chat.id
-
-    # Проверка зависимостей
-    db = dp.workflow_data.get('db')
-    current_settings = dp.workflow_data.get('settings')
-    if not db or not current_settings:
-        logger.error("Не удалось получить соединение с БД или настройки при обработке изображения")
-        await message.answer("Внутренняя ошибка при обработке изображения.", reply_markup=None)
-        return
-
     caption = message.caption or ""
     logger.info(f"Получено фото от user_id={user_id} с подписью: '{caption[:50]}...'" )
 
-    try:
-        # Скачиваем и конвертируем изображение в JPEG (любой формат через Pillow)
-        photo: types.PhotoSize = message.photo[-1]
-        bio = io.BytesIO()
-        await bot.download(photo, destination=bio)
-        bio.seek(0)
-        img = Image.open(bio).convert('RGB')
-        conv_bio = io.BytesIO()
-        img.save(conv_bio, format='JPEG', quality=90)
-        conv_bio.seek(0)
-        encoded = base64.b64encode(conv_bio.getvalue()).decode()
-        data_url = f"data:image/jpeg;base64,{encoded}"
+    db = dp.workflow_data.get('db')
+    current_settings = dp.workflow_data.get('settings')
+    if not db or not current_settings:
+        await message.reply("Произошла внутренняя ошибка (код 1p), попробуйте позже.")
+        return
 
-        # Стриминг ответа vision-модели
-        placeholder = await message.answer("⏳", reply_markup=progress_keyboard(user_id))
-        current_text = ""
-        last_edit = time.monotonic()
-        edit_interval = 1.5
-        # Запрашиваем поток
-        stream = await vision_async_client.chat.completions.create(
-            model="grok-2-vision-1212",
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": [
-                    {"type": "image_url", "image_url": {"url": data_url, "detail": "high"}},
-                    {"type": "text", "text": caption or "Опишите, пожалуйста, это изображение."}
-                ]}
-            ],
-            stream=True
+    user_data = await get_or_create_user(
+        db, user_id, message.from_user.username,
+        message.from_user.first_name, message.from_user.last_name
+    )
+    if not user_data:
+        await message.reply("Произошла внутренняя ошибка (код 3p), попробуйте позже.")
+        return
+
+    is_allowed = await check_and_consume_limit(db, current_settings, user_id)
+    if not is_allowed:
+        kb = InlineKeyboardBuilder()
+        kb.button(text="💎 Оформить подписку", callback_data="subscribe_info")
+        await message.reply(
+            "У вас закончились бесплатные запросы на сегодня 😔\n"
+            "Лимит учитывает отправку текста, фото и документов.\n"
+            "Оформите подписку для снятия ограничений.",
+            reply_markup=kb.as_markup()
         )
-        async for chunk in stream:
-            delta = getattr(chunk.choices[0].delta, 'content', '') or ''
-            current_text += delta
-            now = time.monotonic()
-            if now - last_edit > edit_interval:
-                # Подготавливаем безопасное превью, обрезая по длине
-                html_preview = markdown_to_telegram_html(current_text)
-                if len(html_preview) > TELEGRAM_MAX_LENGTH - 3:
-                    html_preview = html_preview[:TELEGRAM_MAX_LENGTH - 3]
-                preview = html_preview + '...'
-                try:
-                    await bot.edit_message_text(
-                        text=preview,
-                        chat_id=chat_id,
-                        message_id=placeholder.message_id,
-                        parse_mode=ParseMode.HTML,
-                        reply_markup=progress_keyboard(user_id)
-                    )
-                except TelegramAPIError as e:
-                    logger.warning(f"Превышена длина превью, пропускаю обновление: {e}")
-                last_edit = now
+        return
 
-        # Финальная отрисовка
-        final_html = markdown_to_telegram_html(current_text)
-        # Разбиваем на части для Telegram
-        parts = split_text(final_html)
-        # Редактируем плейсхолдер первым фрагментом
-        await bot.edit_message_text(
-            text=parts[0],
-            chat_id=chat_id,
-            message_id=placeholder.message_id,
-            parse_mode=ParseMode.HTML,
-            reply_markup=None
+    if caption:
+        chat_id = message.chat.id
+        user_text = caption
+        if user_id in active_requests:
+            await message.reply(
+                "Пожалуйста, дождитесь завершения предыдущего запроса или отмените его.",
+                reply_markup=progress_keyboard(user_id)
+            )
+            return
+        task = asyncio.create_task(
+            generate_response_task(message, db, current_settings, user_id, user_text, chat_id)
         )
-        # Отправляем остальные части отдельными сообщениями
-        for part in parts[1:]:
-            await message.answer(part, parse_mode=ParseMode.HTML)
-
-        # Сохранить ответ и показать меню
-        await add_message_to_db(db, user_id, "assistant", current_text)
-        await message.answer("🫡", reply_markup=main_menu_keyboard())
-    except Exception as e:
-        logger.exception(f"Критическая ошибка в photo_handler для user_id={user_id}: {e}")
-        await message.answer("Не удалось обработать изображение. Попробуйте позже.", reply_markup=main_menu_keyboard())
+        active_requests[user_id] = task
+        task.add_done_callback(lambda t: active_requests.pop(user_id, None))
+    else:
+        await message.reply(
+            "Я получил ваше фото. Вы можете задать вопрос о нем в следующем сообщении."
+        )
+    return
 
 @dp.message(F.document)
 async def document_handler(message: types.Message):
     user_id = message.from_user.id
-    # Получаем зависимости
+    chat_id = message.chat.id
+    file_name = message.document.file_name or "Без имени"
+    mime_type = message.document.mime_type or "Неизвестный тип"
+    file_id = message.document.file_id
+    logger.info(f"Получен документ от user_id={user_id}: {file_name} (type: {mime_type}, file_id: {file_id})")
+
     db = dp.workflow_data.get('db')
     current_settings = dp.workflow_data.get('settings')
     if not db or not current_settings:
-        logger.error("Не удалось получить соединение с БД или настройки при обработке документа")
-        await message.answer("Внутренняя ошибка при обработке документа.", reply_markup=None)
+        await message.reply("Произошла внутренняя ошибка (код 1d), попробуйте позже.")
         return
 
-    file_name = message.document.file_name or "Без имени"
-    ext = os.path.splitext(file_name)[1].lower()
-    bio = io.BytesIO()
-    # Скачиваем документ
-    await bot.download(message.document, destination=bio)
-    bio.seek(0)
-
-    # Извлечение текста из документа
-    try:
-        if ext == ".pdf":
-            import PyPDF2
-            reader = PyPDF2.PdfReader(bio)
-            text = "".join(page.extract_text() or "" for page in reader.pages)
-        elif ext == ".docx":
-            from docx import Document as DocxDocument
-            docx = DocxDocument(bio)
-            text = "\n".join(para.text for para in docx.paragraphs)
-        else:
-            await message.reply(f"Неподдерживаемый формат документа: {ext}", reply_markup=main_menu_keyboard())
-            return
-    except Exception as e:
-        logger.exception(f"Ошибка извлечения текста из документа: {e}")
-        await message.reply("Не удалось извлечь текст из документа.", reply_markup=main_menu_keyboard())
+    user_data = await get_or_create_user(db, user_id, message.from_user.username, message.from_user.first_name, message.from_user.last_name)
+    if not user_data:
+        await message.reply("Произошла внутренняя ошибка (код 3d), попробуйте позже.")
         return
 
-    # Формируем запрос для модели
-    prompt = f"Прочитай следующий документ {file_name} и дай краткое содержание:\n{text}"
-    await add_message_to_db(db, user_id, "user", prompt)
-    history = await get_last_messages(db, user_id, limit=CONVERSATION_HISTORY_LIMIT)
-
-    # --- Новая логика стриминга с авто-разбиением (как в обычном сообщении) ---
-    chat_id = message.chat.id
-    full_raw_response = ""
-    current_message_text = ""
-    current_message_id = None
-    message_count = 0
-    last_edit_time = 0
-    edit_interval = 1.5
-    formatting_failed = False
-
-    # Отправка первого плейсхолдера
-    try:
-        placeholder_msg = await message.answer("⏳", reply_markup=progress_keyboard(user_id))
-        current_message_id = placeholder_msg.message_id
-        message_count = 1
-        last_edit_time = time.monotonic()
-    except TelegramAPIError as e:
-        logger.error(f"Ошибка отправки плейсхолдера для документа: {e}")
-        await message.reply("Не удалось начать стриминг ответа.", reply_markup=main_menu_keyboard())
+    is_allowed = await check_and_consume_limit(db, current_settings, user_id)
+    if not is_allowed:
+        kb = InlineKeyboardBuilder()
+        kb.button(text="💎 Оформить подписку", callback_data="subscribe_info")
+        await message.reply(
+            "У вас закончились бесплатные запросы на сегодня 😔\n"
+            "Лимит учитывает отправку текста, фото и документов.\n"
+            "Оформите подписку для снятия ограничений.",
+            reply_markup=kb.as_markup()
+        )
         return
 
-    # Читаем стрим от модели
-    async for chunk in stream_xai_response(current_settings.XAI_API_KEY, SYSTEM_PROMPT, history):
-        if not current_message_id:
-            break
-        full_raw_response += chunk
-        now = time.monotonic()
-
-        tentative = current_message_text + chunk
-        try:
-            html_check = markdown_to_telegram_html(tentative) + "..."
-            fmt_err = False
-        except Exception:
-            html_check = tentative + "..."
-            fmt_err = True
-            formatting_failed = True
-
-        # Проверяем, не надо ли начать новое сообщение
-        if len(html_check) > TELEGRAM_MAX_LENGTH:
-            # Финализируем текущее
-            try:
-                part_html = (markdown_to_telegram_html(current_message_text)
-                             if not formatting_failed else current_message_text)
-                if part_html:
-                    await bot.edit_message_text(
-                        text=part_html,
-                        chat_id=chat_id,
-                        message_id=current_message_id,
-                        parse_mode=None if formatting_failed else ParseMode.HTML,
-                        reply_markup=progress_keyboard(user_id)
-                    )
-            except TelegramAPIError as e:
-                logger.error(f"Ошибка финализации части {message_count}: {e}")
-
-            # Новый placeholder
-            current_message_text = chunk
-            message_count += 1
-            try:
-                await bot.edit_message_reply_markup(chat_id=chat_id,
-                                                   message_id=current_message_id,
-                                                   reply_markup=None)
-                placeholder_msg = await message.answer("...", reply_markup=progress_keyboard(user_id))
-                current_message_id = placeholder_msg.message_id
-                last_edit_time = time.monotonic()
-            except TelegramAPIError as e:
-                logger.error(f"Ошибка отправки нового плейсхолдера части {message_count}: {e}")
-                current_message_id = None
-                break
-        else:
-            current_message_text += chunk
-            # Троттлинг редактирования
-            if now - last_edit_time > edit_interval:
-                try:
-                    html_send = (markdown_to_telegram_html(current_message_text)
-                                 if not formatting_failed else current_message_text)
-                    text_preview = html_send + "..."
-                    await bot.edit_message_text(
-                        text=text_preview,
-                        chat_id=chat_id,
-                        message_id=current_message_id,
-                        parse_mode=None if formatting_failed else ParseMode.HTML,
-                        reply_markup=progress_keyboard(user_id)
-                    )
-                    last_edit_time = now
-                except TelegramRetryAfter as e:
-                    await asyncio.sleep(e.retry_after + 0.1)
-                    last_edit_time = time.monotonic()
-                except TelegramAPIError as e:
-                    logger.error(f"Ошибка редактирования части {message_count}: {e}")
-
-    # Финализация последнего сообщения
-    if current_message_id and current_message_text:
-        try:
-            final_html = (markdown_to_telegram_html(current_message_text)
-                          if not formatting_failed else current_message_text)
-            await bot.edit_message_text(
-                text=final_html,
-                chat_id=chat_id,
-                message_id=current_message_id,
-                parse_mode=None if formatting_failed else ParseMode.HTML,
-                reply_markup=None
-            )
-            await message.answer("🫡", reply_markup=main_menu_keyboard())
-        except TelegramAPIError as e:
-            logger.error(f"Ошибка финализации последнего сообщения: {e}")
-    elif not full_raw_response and message_count == 1 and current_message_id:
-        try:
-            await bot.edit_message_text(
-                "К сожалению, не удалось получить ответ от AI.",
-                chat_id=chat_id,
-                message_id=current_message_id,
-                reply_markup=None
-            )
-            await message.answer("🫡", reply_markup=main_menu_keyboard())
-        except TelegramAPIError:
-            pass
-
-    # Сохраняем полный ответ в БД
-    if full_raw_response:
-        try:
-            await add_message_to_db(db, user_id, "assistant", full_raw_response)
-        except Exception as e:
-            logger.error(f"Ошибка сохранения ответа в БД: {e}")
+    logger.info(f"Пользователь {user_id} допущен к обработке документа '{file_name}' (лимит OK).")
+    await message.reply(f"⏳ Начинаю обработку документа '{file_name}'...")
+    # Ваш код обработки документа здесь
 
 # --- Обработчики для кнопок меню ReplyKeyboardMarkup
 @dp.message(F.text == "🔄 Новый диалог")
@@ -1460,7 +1448,7 @@ async def handle_subscription_button(message: types.Message):
 async def handle_help_button(message: types.Message):
     help_text = (
         "<b>Помощь по боту:</b>\n\n"
-        "🤖 Я - ваш AI ассистент, работающий на модели Grok.\n"
+        "🤖 Я первый \"умный\" и бесплатный AI ассистент.\n"
         "❓ Просто напишите ваш вопрос, и я постараюсь ответить.\n"
         "🔄 Используйте кнопку \"Новый диалог\" или команду /clear, чтобы очистить историю и начать разговор с чистого листа.\n"
         "📊 Кнопка \"Мои лимиты\" покажет, сколько бесплатных сообщений у вас осталось сегодня или до какого числа действует подписка.\n"
@@ -1510,7 +1498,13 @@ async def set_bot_commands(bot_instance: Bot):
     commands = [
         types.BotCommand(command="/start", description="Начать диалог / Показать меню"),
         types.BotCommand(command="/clear", description="Очистить историю диалога"),
-        # Добавьте другие команды если нужно
+        # Админ-панель
+        types.BotCommand(command="/admin", description="Список команд администратора"),
+        types.BotCommand(command="/stats", description="Показать статистику бота"),
+        types.BotCommand(command="/find_user", description="Поиск пользователя по ID или username"),
+        types.BotCommand(command="/list_subs", description="Список пользователей по подписке"),
+        types.BotCommand(command="/send_to_user", description="Отправить сообщение конкретному пользователю"),
+        types.BotCommand(command="/broadcast", description="Рассылка сообщения всем пользователям"),
     ]
     try:
         await bot_instance.set_my_commands(commands)
@@ -1604,26 +1598,901 @@ async def cleanup_tasks():
         except asyncio.CancelledError:
              logger.info("Задачи были отменены во время завершения.")
 
+async def generate_response_task(
+    message: types.Message,
+    db,
+    current_settings: Settings,
+    user_id: int,
+    user_text: str,
+    chat_id: int
+):
+    """Генерация ответа в фоне со стримингом, прогрессом и сохранением в БД."""
+    progress_msg = None
+    full_raw = ""
+    try:
+        # Отправляем прогресс-сообщение
+        progress_msg = await message.reply(
+            "⏳ Генерирую ответ...",
+            reply_markup=progress_keyboard(user_id)
+        )
+        progress_message_ids[user_id] = progress_msg.message_id
+        # Сохраняем пользовательский запрос
+        await add_message_to_db(db, user_id, "user", user_text)
+        # Получаем историю
+        history = await get_last_messages(db, user_id, limit=CONVERSATION_HISTORY_LIMIT)
+        # Настройка для стриминга
+        current_text = ""
+        last_edit = time.monotonic()
+        interval = 1.5
+        formatting_failed = False
+        # Стриминг ответа
+        async for chunk in stream_xai_response(
+            current_settings.XAI_API_KEY,
+            SYSTEM_PROMPT,
+            history
+        ):
+            full_raw += chunk
+            current_text += chunk
+            now = time.monotonic()
+            if now - last_edit > interval and progress_msg:
+                try:
+                    preview = markdown_to_telegram_html(current_text) + '...'
+                    await bot.edit_message_text(
+                        text=preview,
+                        chat_id=chat_id,
+                        message_id=progress_msg.message_id,
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=progress_keyboard(user_id)
+                    )
+                    last_edit = now
+                except TelegramRetryAfter as rte:
+                    await asyncio.sleep(rte.retry_after + 0.1)
+                    last_edit = time.monotonic()
+                except TelegramAPIError:
+                    formatting_failed = True
+        # Финализация
+        if progress_msg:
+            final_text = markdown_to_telegram_html(current_text) if not formatting_failed else current_text
+            await bot.edit_message_text(
+                text=final_text,
+                chat_id=chat_id,
+                message_id=progress_msg.message_id,
+                parse_mode=ParseMode.HTML,
+                reply_markup=None
+            )
+            await message.answer("🫡", reply_markup=main_menu_keyboard())
+        else:
+            # Если progress_msg исчез, отправим новый
+            parts = split_text(markdown_to_telegram_html(full_raw))
+            for i, part in enumerate(parts):
+                await message.answer(part, parse_mode=ParseMode.HTML, reply_markup=main_menu_keyboard() if i == len(parts)-1 else None)
+        # Сохраняем ответ ассистента
+        if full_raw:
+            await add_message_to_db(db, user_id, "assistant", full_raw)
+    except asyncio.CancelledError:
+        # При отмене
+        if progress_msg:
+            try:
+                await bot.edit_message_text(
+                    text="Генерация отменена.",
+                    chat_id=chat_id,
+                    message_id=progress_msg.message_id,
+                    reply_markup=None
+                )
+            except TelegramAPIError:
+                pass
+    except Exception as e:
+        logger.exception(f"Ошибка в generate_response_task для user_id={user_id}: {e}")
+        if progress_msg:
+            try:
+                await bot.edit_message_text(
+                    text="Произошла ошибка при генерировании ответа.",
+                    chat_id=chat_id,
+                    message_id=progress_msg.message_id,
+                    reply_markup=None
+                )
+            except TelegramAPIError:
+                pass
+    finally:
+        progress_message_ids.pop(user_id, None)
+        active_requests.pop(user_id, None)
+
+# --- НАЧАЛО: Админ-команды с проверкой is_admin ---
+
+# Список административных команд с описаниями
+ADMIN_COMMANDS_LIST = [
+    ("/admin", "Показать это сообщение с описанием команд."),
+    ("/stats", "Показать расширенную статистику по боту."),
+    ("/find_user", "`<id_or_username>` - Найти пользователя по ID или @username."),
+    ("/list_subs", "`[active|expired]` - Показать список пользователей с подписками (по умолчанию 'active', можно указать 'expired')."),
+    ("/grant_admin", "Выдать права администратора другому пользователю."),
+    ("/send_to_user", "`<user_id> <text>` - Отправить сообщение пользователю от имени бота."),
+    ("/broadcast", "`<text>` - **ОСТОРОЖНО!** Отправить сообщение всем пользователям бота (может занять время)."),
+]
+
+@dp.message(Command("admin"), IsAdmin())
+async def admin_help_menu(message: types.Message):
+    """Отправляет отформатированный список всех админ-команд."""
+    help_lines = ["<b>Административные команды:</b>\n"]
+
+    for command, description in ADMIN_COMMANDS_LIST:
+        escaped_description = html.escape(description)
+        help_lines.append(f"<code>{command}</code> - {escaped_description}")
+
+    help_text = "\n".join(help_lines)
+    await message.reply(help_text, parse_mode=ParseMode.HTML)
+
+@dp.message(Command("stats"), IsAdmin())
+async def admin_stats_enhanced(message: types.Message):
+    """Расширенная статистика бота для админа."""
+    db = dp.workflow_data.get('db')
+    settings_local = dp.workflow_data.get('settings')
+    try:
+        stats = await get_extended_stats(db, settings_local)
+        report = (
+            "📊 *Расширенная Статистика* 📊\n\n"
+            "*Пользователи:*\n"
+            f"- Всего: {stats['total_users']}\n"
+            f"- Активных сегодня: {stats['active_today']}\n"
+            f"- Активных за 7 дней: {stats['active_week']}\n"
+            f"- Новых сегодня: {stats['new_today']}\n"
+            f"- Новых за 7 дней: {stats['new_week']}\n\n"
+            "*Подписки:*\n"
+            f"- Активных сейчас: {stats['active_subs']}\n"
+            f"- Новых сегодня: {stats['new_subs_today']}\n"
+            f"- Новых за 7 дней: {stats['new_subs_week']}\n"
+            f"- Истекает в ближайшие 7 дней: {stats['expiring_subs']}\n"
+        )
+        await message.reply(report, parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        logger.exception("Ошибка получения расширенной статистики")
+        await message.reply(f"Ошибка получения статистики: {e}")
+
+@dp.message(Command("grant_admin"))
+async def grant_admin_handler(message: types.Message):
+    db = dp.workflow_data.get('db')
+    settings_local = dp.workflow_data.get('settings')
+    sender = message.from_user.id
+    sender_data = await get_user(db, sender)
+    if not sender_data or not sender_data.get('is_admin', False):
+        return await message.reply("🚫 У вас нет прав для выполнения этой команды.")
+
+    args = message.text.strip().split(maxsplit=1)
+    if len(args) < 2:
+        return await message.reply("Использование: /grant_admin <user_id>")
+    try:
+        target_id = int(args[1])
+    except ValueError:
+        return await message.reply("Неверный формат ID пользователя.")
+
+    target_data = await get_user(db, target_id)
+    if not target_data:
+        return await message.reply(f"Пользователь с ID {target_id} не найден.")
+
+    # Присваиваем права администратора
+    await update_user_admin(db, target_id, True)
+    await message.reply(f"✅ Пользователь {target_id} теперь администратор.")
+
+@dp.message(Command("broadcast"), IsAdmin())
+async def broadcast_handler(message: types.Message, command: CommandObject):
+    db = dp.workflow_data.get('db')
+    user_id = message.from_user.id
+    # Фильтрация IsAdmin
+    settings_local = dp.workflow_data.get('settings')
+    text = (command.args or "").strip()
+    if not text:
+        await message.reply("Использование: /broadcast <текст>")
+        return
+    # Получаем список
+    if settings_local.USE_SQLITE:
+        def _all_ids():
+            conn = sqlite3.connect(db)
+            cur = conn.cursor()
+            cur.execute("SELECT user_id FROM users")
+            ids = [r[0] for r in cur.fetchall()]
+            conn.close()
+            return ids
+        user_ids = await asyncio.to_thread(_all_ids)
+    else:
+        async with db.acquire() as conn:
+            records = await conn.fetch("SELECT user_id FROM users")
+            user_ids = [r['user_id'] for r in records]
+    sent = 0
+    total = len(user_ids)
+    for uid in user_ids:
+        try:
+            await bot.send_message(uid, text)
+            sent += 1
+            logger.info(f"Broadcast to {uid} succeeded")
+        except Exception as e:
+            logger.warning(f"Broadcast to {uid} failed: {e}")
+        await asyncio.sleep(0.1)
+    await message.reply(f"Рассылка завершена: отправлено {sent}/{total} пользователям.")
+
+@dp.message(Command("find_user"), IsAdmin())
+async def admin_find_user(message: types.Message, command: CommandObject):
+    """Поиск пользователя по ID или username для админа."""
+    db = dp.workflow_data.get('db')
+    settings_local = dp.workflow_data.get('settings')
+    if not db:
+        return await message.reply("Ошибка БД")
+    if not command.args:
+        return await message.reply("Укажите ID или username: /find_user <query>")
+    query = command.args.strip()
+    user_data = None
+    # Попытка поиска по ID
+    try:
+        user_id_to_find = int(query)
+        user_data = await get_user(db, user_id_to_find)
+    except ValueError:
+        # Поиск по username
+        query_lower = query.lower().lstrip('@')
+        if settings_local.USE_SQLITE:
+            def _find_by_username():
+                conn = sqlite3.connect(db)
+                conn.row_factory = sqlite3.Row
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT * FROM users WHERE lower(username) = ?", (query_lower,)
+                )
+                row = cur.fetchone()
+                conn.close()
+                return dict(row) if row else None
+            user_data = await asyncio.to_thread(_find_by_username)
+        else:
+            async with db.acquire() as conn:
+                row = await conn.fetchrow(
+                    "SELECT * FROM users WHERE lower(username) = $1", query_lower
+                )
+                user_data = dict(row) if row else None
+    if not user_data:
+        return await message.reply(f"Пользователь по запросу '{query}' не найден.")
+    # Форматирование информации о пользователе
+    info_lines = [f"Найден пользователь по запросу '{query}':"]
+    info_lines.append(f"ID: {user_data.get('user_id')}")
+    info_lines.append(f"Username: {user_data.get('username')}")
+    info_lines.append(
+        f"Имя: {user_data.get('first_name')} {user_data.get('last_name')}"
+    )
+    info_lines.append(f"Регистрация: {user_data.get('registration_date')}")
+    info_lines.append(
+        f"Последняя активность: {user_data.get('last_active_date')}"
+    )
+    info_lines.append(
+        f"Бесплатных сегодня: {user_data.get('free_messages_today')}"
+    )
+    info_lines.append(
+        f"Подписка: {user_data.get('subscription_status')}"
+    )
+    info_lines.append(
+        f"Конец подписки: {user_data.get('subscription_expires')}"
+    )
+    info_lines.append(f"Админ: {user_data.get('is_admin')}" )
+    await message.reply("\n".join(info_lines))
+
+@dp.message(Command("list_subs"), IsAdmin())
+async def list_subs_handler(message: types.Message, command: CommandObject):
+    db = dp.workflow_data.get('db')
+    settings_local = dp.workflow_data.get('settings')
+    mode = (command.args or "active").strip().lower()
+    logger.info(f"Admin {message.from_user.id} вызвал /list_subs mode={mode}")
+    if settings_local.USE_SQLITE:
+        def _list():
+            conn = sqlite3.connect(db)
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            if mode == "active":
+                cur.execute("SELECT user_id, username FROM users WHERE subscription_status='active'")
+            else:
+                cur.execute(
+                    "SELECT user_id, username FROM users WHERE subscription_status='inactive' AND DATE(subscription_expires) BETWEEN DATE('now','-7 days') AND DATE('now')"
+                )
+            rows = cur.fetchall()
+            conn.close()
+            return rows
+        rows = await asyncio.to_thread(_list)
+        subs = [dict(r) for r in rows]
+    else:
+        async with db.acquire() as conn:
+            if mode == "active":
+                records = await conn.fetch("SELECT user_id, username FROM users WHERE subscription_status='active'")
+            else:
+                records = await conn.fetch(
+                    "SELECT user_id, username FROM users WHERE subscription_status='inactive' AND subscription_expires BETWEEN (NOW() - INTERVAL '7 days') AND NOW()"
+                )
+            subs = [dict(r) for r in records]
+    if not subs:
+        await message.reply("Нет пользователей для данного режима.")
+        return
+    lines = [f"{s['user_id']} (@{s.get('username','')})" for s in subs]
+    text = f"Список подписок ({mode}):\n" + "\n".join(lines)
+    await message.reply(text)
+
+@dp.message(Command("send_to_user"), IsAdmin())
+async def send_to_user_handler(message: types.Message, command: CommandObject):
+    db = dp.workflow_data.get('db')
+    settings_local = dp.workflow_data.get('settings')
+    # Либо фильтр IsAdmin
+    parts = (command.args or "").split(None, 1)
+    if len(parts) < 2:
+        await message.reply("Использование: /send_to_user <user_id> <текст>")
+        return
+    try:
+        target = int(parts[0])
+    except ValueError:
+        await message.reply("Неверный user_id.")
+        return
+    text = parts[1]
+    try:
+        await bot.send_message(target, text)
+        logger.info(f"Admin {message.from_user.id} отправил сообщение пользователю {target}")
+        await message.reply(f"Сообщение пользователю {target} отправлено.")
+    except Exception as e:
+        logger.warning(f"Ошибка при отправке {target}: {e}")
+        await message.reply(f"Не удалось отправить сообщение пользователю {target}.")
+
+# --- КОНЕЦ: Админ-команды ---
+
+# --- Admin helper functions: сбор статистики бота ---
+async def get_extended_stats(db, settings: Settings) -> dict[str, int]:
+    """Собирает расширенную статистику пользователей и подписок."""
+    # SQLite
+    if settings.USE_SQLITE:
+        def _ext():
+            conn = sqlite3.connect(db)
+            cur = conn.cursor()
+            cur.execute("SELECT COUNT(*) FROM users")
+            total = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM users WHERE last_active_date>=DATE('now')")
+            active_today = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM users WHERE last_active_date>=DATE('now','-7 days')")
+            active_week = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM users WHERE registration_date>=DATE('now')")
+            new_today = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM users WHERE registration_date>=DATE('now','-7 days')")
+            new_week = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM users WHERE subscription_status='active' AND subscription_expires>DATE('now')")
+            active_subs = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM users WHERE subscription_status='active' AND registration_date>=DATE('now')")
+            new_subs_today = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM users WHERE subscription_status='active' AND registration_date>=DATE('now','-7 days')")
+            new_subs_week = cur.fetchone()[0]
+            cur.execute(
+                "SELECT COUNT(*) FROM users WHERE subscription_status='active' AND subscription_expires BETWEEN DATE('now') AND DATE('now','+7 days')"
+            )
+            expiring = cur.fetchone()[0]
+            conn.close()
+            return {
+                'total_users': total,
+                'active_today': active_today,
+                'active_week': active_week,
+                'new_today': new_today,
+                'new_week': new_week,
+                'active_subs': active_subs,
+                'new_subs_today': new_subs_today,
+                'new_subs_week': new_subs_week,
+                'expiring_subs': expiring
+            }
+        return await asyncio.to_thread(_ext)
+    # PostgreSQL
+    async with db.acquire() as conn:
+        rec = await conn.fetchrow(
+            """
+            SELECT
+             (SELECT COUNT(*) FROM users) AS total,
+             (SELECT COUNT(*) FROM users WHERE last_active_date>=CURRENT_DATE) AS active_today,
+             (SELECT COUNT(*) FROM users WHERE last_active_date>=(CURRENT_DATE - INTERVAL '7 days')) AS active_week,
+             (SELECT COUNT(*) FROM users WHERE registration_date>=CURRENT_DATE) AS new_today,
+             (SELECT COUNT(*) FROM users WHERE registration_date>=(CURRENT_DATE - INTERVAL '7 days')) AS new_week,
+             (SELECT COUNT(*) FROM users WHERE subscription_status='active' AND subscription_expires>NOW()) AS active_subs,
+             (SELECT COUNT(*) FROM users WHERE subscription_status='active' AND registration_date>=CURRENT_DATE) AS new_subs_today,
+             (SELECT COUNT(*) FROM users WHERE subscription_status='active' AND registration_date>=(CURRENT_DATE - INTERVAL '7 days')) AS new_subs_week,
+             (SELECT COUNT(*) FROM users WHERE subscription_status='active' AND subscription_expires BETWEEN NOW() AND (NOW() + INTERVAL '7 days')) AS expiring_subs
+            """
+        )
+    return {
+        'total_users': rec['total'],
+        'active_today': rec['active_today'],
+        'active_week': rec['active_week'],
+        'new_today': rec['new_today'],
+        'new_week': rec['new_week'],
+        'active_subs': rec['active_subs'],
+        'new_subs_today': rec['new_subs_today'],
+        'new_subs_week': rec['new_subs_week'],
+        'expiring_subs': rec['expiring_subs']
+    }
+
+# --- Обработчик отмены генерации ---
+@dp.callback_query(F.data.startswith("cancel_generation_"))
+async def cancel_generation_callback(callback: types.CallbackQuery):
+    """Обрабатывает отмену генерации: прекращает задачу, убирает клавиатуру и показывает меню."""
+    # Парсим user_id из callback_data
+    try:
+        user_id_to_cancel = int(callback.data.rsplit("_", 1)[-1])
+    except ValueError:
+        await callback.answer("Ошибка обработки отмены.", show_alert=True)
+        return
+
+    # Прекращаем задачу генерации и восстанавливаем лимит, если была
+    task = active_requests.pop(user_id_to_cancel, None)
+    if task:
+        task.cancel()
+        db = dp.workflow_data.get('db')
+        settings_local = dp.workflow_data.get('settings')
+        if db and settings_local:
+            try:
+                if settings_local.USE_SQLITE:
+                    def _restore():
+                        conn = sqlite3.connect(db)
+                        cursor = conn.cursor()
+                        cursor.execute(
+                            "UPDATE users SET free_messages_today = free_messages_today + 1 WHERE user_id = ?",
+                            (user_id_to_cancel,)
+                        )
+                        conn.commit()
+                        conn.close()
+                    await asyncio.to_thread(_restore)
+                else:
+                    async with db.acquire() as conn:
+                        await conn.execute(
+                            "UPDATE users SET free_messages_today = free_messages_today + 1 WHERE user_id = $1",
+                            user_id_to_cancel
+                        )
+            except Exception:
+                logger.exception(f"Не удалось восстановить лимит для user_id={user_id_to_cancel}")
+
+    # Убираем inline-клавиатуру отмены
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except TelegramAPIError:
+        pass
+
+    # Уведомляем пользователя о завершении отмены
+    await callback.answer("Генерация ответа отменена.", show_alert=False)
+
+    # Показываем главное меню
+    await callback.message.answer(
+        "🫡",
+        reply_markup=main_menu_keyboard()
+    )
+
+@dp.callback_query(F.data == "clear_history")
+async def clear_history_callback(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    # Получаем зависимости из диспетчера (можно и через bot.dispatcher)
+    db = dp.workflow_data.get('db')
+    current_settings = dp.workflow_data.get('settings')
+
+    if not db or not current_settings:
+        logger.error("Не удалось получить БД/настройки при очистке истории (callback)")
+        await callback.answer("Ошибка при очистке истории", show_alert=True)
+        return
+
+    # --- Получаем или создаем пользователя (обновляем last_active) ---
+    user_data = await get_or_create_user(
+        db,
+        user_id,
+        callback.from_user.username,
+        callback.from_user.first_name,
+        callback.from_user.last_name
+    )
+    if not user_data:
+        logger.error(f"Не удалось получить или создать пользователя {user_id} в clear_history_callback")
+        await callback.answer("Произошла внутренняя ошибка (код ch1), попробуйте позже.", show_alert=True)
+        return
+    logger.debug(f"Данные пользователя {user_id} (clear_history_callback): {user_data}")
+    # --- Конец изменений ---
+
+    try:
+        rows_deleted_count = 0
+        if current_settings.USE_SQLITE:
+            def _clear_history_sqlite():
+                db_path = db # db здесь это путь к файлу
+                conn = sqlite3.connect(db_path)
+                cursor = conn.cursor()
+                cursor.execute("DELETE FROM conversations WHERE user_id = ?", (user_id,))
+                deleted_count = cursor.rowcount
+                conn.commit()
+                conn.close()
+                return deleted_count
+            rows_deleted_count = await asyncio.to_thread(_clear_history_sqlite)
+            logger.info(f"SQLite: Очищена история пользователя {user_id}, удалено {rows_deleted_count} записей")
+        else:
+            # PostgreSQL
+            async with db.acquire() as connection: # db здесь это пул
+                result = await connection.execute("DELETE FROM conversations WHERE user_id = $1", user_id) # Убрал RETURNING id для простоты
+                # result это строка вида "DELETE N", парсим N
+                try:
+                    rows_deleted_count = int(result.split()[-1]) if result.startswith("DELETE") else 0
+                except:
+                    rows_deleted_count = -1 # Не удалось распарсить
+                logger.info(f"PostgreSQL: Очищена история пользователя {user_id}, результат: {result}")
+
+        await callback.answer(f"История очищена ({rows_deleted_count} записей удалено)", show_alert=False)
+        # Можно добавить сообщение в чат для наглядности
+        # Редактируем исходное сообщение или отвечаем новым
+        try:
+            # Пытаемся отредактировать, если это было сообщение с кнопкой
+            await callback.message.edit_text("История диалога очищена.", reply_markup=None)
+        except TelegramAPIError:
+            # Если не вышло (например, это было не сообщение бота или прошло много времени),
+            # отправляем новое сообщение
+             await callback.message.answer("История диалога очищена.")
+
+    except Exception as e:
+        logger.exception(f"Ошибка при очистке истории (callback) для user_id={user_id}: {e}")
+        await callback.answer("Произошла ошибка при очистке", show_alert=True)
+
+# --- Обработчик команды /clear ---
+@dp.message(Command("clear"))
+async def clear_command_handler(message: types.Message):
+    user_id = message.from_user.id
+    db = dp.workflow_data.get('db')
+    current_settings = dp.workflow_data.get('settings')
+
+    if not db or not current_settings:
+        logger.error("Не удалось получить БД/настройки при очистке истории (/clear)")
+        await message.answer("Произошла внутренняя ошибка (код 2), попробуйте позже.")
+        return
+
+    # --- Получаем или создаем пользователя (обновляем last_active) ---
+    user_data = await get_or_create_user(
+        db,
+        user_id,
+        message.from_user.username,
+        message.from_user.first_name,
+        message.from_user.last_name
+    )
+    if not user_data:
+        logger.error(f"Не удалось получить или создать пользователя {user_id} в clear_command_handler")
+        await message.answer("Произошла внутренняя ошибка (код cl1), попробуйте позже.")
+        return
+    logger.debug(f"Данные пользователя {user_id} (clear_command): {user_data}")
+    # --- Конец изменений ---
+
+    try:
+        rows_deleted_count = 0
+        if current_settings.USE_SQLITE:
+            def _clear_history_sqlite_cmd():
+                db_path = db
+                conn = sqlite3.connect(db_path)
+                cursor = conn.cursor()
+                cursor.execute("DELETE FROM conversations WHERE user_id = ?", (user_id,))
+                deleted_count = cursor.rowcount
+                conn.commit()
+                conn.close()
+                return deleted_count
+            rows_deleted_count = await asyncio.to_thread(_clear_history_sqlite_cmd)
+            logger.info(f"SQLite: Очищена история пользователя {user_id} по команде /clear, удалено {rows_deleted_count} записей")
+        else:
+            # PostgreSQL
+            async with db.acquire() as connection:
+                result = await connection.execute("DELETE FROM conversations WHERE user_id = $1", user_id)
+                try:
+                     rows_deleted_count = int(result.split()[-1]) if result.startswith("DELETE") else 0
+                except:
+                    rows_deleted_count = -1
+                logger.info(f"PostgreSQL: Очищена история пользователя {user_id} по команде /clear, результат: {result}")
+
+        await message.answer(f"История диалога очищена ({rows_deleted_count} записей удалено).")
+    except Exception as e:
+        logger.exception(f"Ошибка при очистке истории (/clear) для user_id={user_id}: {e}")
+        await message.answer("Произошла ошибка при очистке истории.")
+
+# --- Обработчики медиа (обновлено для vision) ---
+@dp.message(F.photo)
+async def photo_handler(message: types.Message):
+    user_id = message.from_user.id
+    caption = message.caption or ""
+    logger.info(f"Получено фото от user_id={user_id} с подписью: '{caption[:50]}...'" )
+
+    db = dp.workflow_data.get('db')
+    current_settings = dp.workflow_data.get('settings')
+    if not db or not current_settings:
+        await message.reply("Произошла внутренняя ошибка (код 1p), попробуйте позже.")
+        return
+
+    user_data = await get_or_create_user(
+        db, user_id, message.from_user.username,
+        message.from_user.first_name, message.from_user.last_name
+    )
+    if not user_data:
+        await message.reply("Произошла внутренняя ошибка (код 3p), попробуйте позже.")
+        return
+
+    is_allowed = await check_and_consume_limit(db, current_settings, user_id)
+    if not is_allowed:
+        kb = InlineKeyboardBuilder()
+        kb.button(text="💎 Оформить подписку", callback_data="subscribe_info")
+        await message.reply(
+            "У вас закончились бесплатные запросы на сегодня 😔\n"
+            "Лимит учитывает отправку текста, фото и документов.\n"
+            "Оформите подписку для снятия ограничений.",
+            reply_markup=kb.as_markup()
+        )
+        return
+
+    if caption:
+        chat_id = message.chat.id
+        user_text = caption
+        if user_id in active_requests:
+            await message.reply(
+                "Пожалуйста, дождитесь завершения предыдущего запроса или отмените его.",
+                reply_markup=progress_keyboard(user_id)
+            )
+            return
+        task = asyncio.create_task(
+            generate_response_task(message, db, current_settings, user_id, user_text, chat_id)
+        )
+        active_requests[user_id] = task
+        task.add_done_callback(lambda t: active_requests.pop(user_id, None))
+    else:
+        await message.reply(
+            "Я получил ваше фото. Вы можете задать вопрос о нем в следующем сообщении."
+        )
+    return
+
+@dp.message(F.document)
+async def document_handler(message: types.Message):
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+    file_name = message.document.file_name or "Без имени"
+    mime_type = message.document.mime_type or "Неизвестный тип"
+    file_id = message.document.file_id
+    logger.info(f"Получен документ от user_id={user_id}: {file_name} (type: {mime_type}, file_id: {file_id})")
+
+    db = dp.workflow_data.get('db')
+    current_settings = dp.workflow_data.get('settings')
+    if not db or not current_settings:
+        await message.reply("Произошла внутренняя ошибка (код 1d), попробуйте позже.")
+        return
+
+    user_data = await get_or_create_user(db, user_id, message.from_user.username, message.from_user.first_name, message.from_user.last_name)
+    if not user_data:
+        await message.reply("Произошла внутренняя ошибка (код 3d), попробуйте позже.")
+        return
+
+    is_allowed = await check_and_consume_limit(db, current_settings, user_id)
+    if not is_allowed:
+        kb = InlineKeyboardBuilder()
+        kb.button(text="💎 Оформить подписку", callback_data="subscribe_info")
+        await message.reply(
+            "У вас закончились бесплатные запросы на сегодня 😔\n"
+            "Лимит учитывает отправку текста, фото и документов.\n"
+            "Оформите подписку для снятия ограничений.",
+            reply_markup=kb.as_markup()
+        )
+        return
+
+    logger.info(f"Пользователь {user_id} допущен к обработке документа '{file_name}' (лимит OK).")
+    await message.reply(f"⏳ Начинаю обработку документа '{file_name}'...")
+    # Ваш код обработки документа здесь
+
+# --- Обработчики для кнопок меню ReplyKeyboardMarkup
+@dp.message(F.text == "🔄 Новый диалог")
+async def handle_new_dialog_button(message: types.Message):
+    # Просто вызываем существующий обработчик команды /clear
+    await clear_command_handler(message)
+
+@dp.message(F.text == "📊 Мои лимиты")
+async def handle_my_limits_button(message: types.Message):
+    user_id = message.from_user.id
+    db = dp.workflow_data.get('db')
+    if not db:
+        await message.reply("Ошибка получения данных.")
+        return
+    user_data = await get_user(db, user_id)
+    if not user_data:
+        await message.reply("Не удалось найти ваши данные.")
+        return
+    limit_info = f"Осталось бесплатных сообщений сегодня: {user_data.get('free_messages_today', 'N/A')}"
+    sub_info = "Подписка: неактивна"
+    if user_data.get('subscription_status') == 'active':
+        expires_ts = user_data.get('subscription_expires')
+        if isinstance(expires_ts, datetime.datetime):
+            expires_str = expires_ts.strftime('%Y-%m-%d %H:%M')
+            sub_info = f"Подписка активна до: {expires_str}"
+        else:
+            sub_info = f"Подписка активна до: {expires_ts}"
+    await message.reply(f"Информация о ваших лимитах:\n\n{limit_info}\n{sub_info}")
+
+@dp.message(F.text == "💎 Подписка")
+async def handle_subscription_button(message: types.Message):
+    # Заглушка раздела подписки
+    await message.reply(
+        "Раздел 'Подписка'.\n\n"
+        "Доступные тарифы:\n- 7 дней / 100 руб.\n- 30 дней / 300 руб.\n\n"
+        "(Функционал оплаты будет добавлен позже)"
+    )
+
+@dp.message(F.text == "🆘 Помощь")
+async def handle_help_button(message: types.Message):
+    help_text = (
+        "<b>Помощь по боту:</b>\n\n"
+        "🤖 Я первый \"умный\" и бесплатный AI ассистент.\n"
+        "❓ Просто напишите ваш вопрос, и я постараюсь ответить.\n"
+        "🔄 Используйте кнопку \"Новый диалог\" или команду /clear, чтобы очистить историю и начать разговор с чистого листа.\n"
+        "📊 Кнопка \"Мои лимиты\" покажет, сколько бесплатных сообщений у вас осталось сегодня или до какого числа действует подписка.\n"
+        "💎 Кнопка \"Подписка\" расскажет о платных тарифах для снятия лимитов."
+    )
+    await message.reply(help_text, reply_markup=main_menu_keyboard())
+
+@dp.message(F.text == "❓ Задать вопрос")
+async def handle_ask_question_button(message: types.Message):
+    await message.reply("Просто напишите ваш вопрос в чат 👇", reply_markup=main_menu_keyboard())
+
+# --- Функции запуска и остановки ---
+
+# Восстанавливаем функцию on_shutdown
+async def on_shutdown(**kwargs):
+    logger.info("Завершение работы бота...")
+    # Получаем dp и из него workflow_data
+    dp_local = kwargs.get('dispatcher') # aiogram передает dispatcher
+    if not dp_local:
+        logger.error("Не удалось получить dispatcher в on_shutdown")
+        return
+
+    db = dp_local.workflow_data.get('db')
+    settings_local = dp_local.workflow_data.get('settings')
+
+    if db and settings_local:
+        if not settings_local.USE_SQLITE:
+            try:
+                # db здесь это пул соединений asyncpg
+                if isinstance(db, asyncpg.Pool):
+                    await db.close()
+                    logger.info("Пул соединений PostgreSQL успешно закрыт")
+                else:
+                    logger.warning("Объект 'db' не является пулом asyncpg, закрытие не выполнено.")
+            except Exception as e:
+                logger.error(f"Ошибка при закрытии пула соединений PostgreSQL: {e}")
+        else:
+            logger.info("Используется SQLite, явное закрытие пула не требуется.")
+    else:
+         logger.warning("Не удалось получить 'db' или 'settings' из workflow_data при завершении работы.")
+
+    logger.info("Бот остановлен.")
+
+
+# --- Установка команд бота (если еще не сделано) ---
+async def set_bot_commands(bot_instance: Bot):
+    commands = [
+        types.BotCommand(command="/start", description="Начать диалог / Показать меню"),
+        types.BotCommand(command="/clear", description="Очистить историю диалога"),
+        # Админ-панель
+        types.BotCommand(command="/admin", description="Список команд администратора"),
+        types.BotCommand(command="/stats", description="Показать статистику бота"),
+        types.BotCommand(command="/find_user", description="Поиск пользователя по ID или username"),
+        types.BotCommand(command="/list_subs", description="Список пользователей по подписке"),
+        types.BotCommand(command="/send_to_user", description="Отправить сообщение конкретному пользователю"),
+        types.BotCommand(command="/broadcast", description="Рассылка сообщения всем пользователям"),
+    ]
+    try:
+        await bot_instance.set_my_commands(commands)
+        logger.info("Команды бота успешно установлены.")
+    except TelegramAPIError as e:
+        logger.error(f"Ошибка при установке команд бота: {e}")
+
+# --- Главная функция запуска ---
+async def main():
+    logger.info(f"Запуск приложения с настройками базы данных: {settings.DATABASE_URL}")
+    db_connection = None # Переименуем, чтобы не конфликтовать с именем модуля
+
+    try:
+        # Выбор типа БД на основе URL из настроек
+        if settings.USE_SQLITE:
+            logger.info("Используется SQLite для хранения данных")
+            db_connection = await init_sqlite_db(settings.DATABASE_URL) # Возвращает путь
+        else:
+            logger.info("Используется PostgreSQL для хранения данных")
+            # Попытка подключения с таймаутом и обработкой ошибок
+            try:
+                logger.info(f"Подключение к PostgreSQL: {settings.DATABASE_URL}")
+                # Увеличим таймауты для create_pool
+                db_connection = await asyncio.wait_for(
+                    asyncpg.create_pool(dsn=settings.DATABASE_URL, timeout=30.0, command_timeout=60.0, min_size=1, max_size=10),
+                    timeout=45.0 # Общий таймаут на создание пула
+                )
+                if not db_connection:
+                    logger.error("Не удалось создать пул соединений PostgreSQL (вернулся None)")
+                    sys.exit(1)
+
+                logger.info("Пул соединений PostgreSQL успешно создан")
+                # Проверим соединение и инициализируем таблицу
+                await init_db_postgres(db_connection)
+
+            except asyncio.TimeoutError:
+                logger.error("Превышен таймаут подключения к базе данных PostgreSQL")
+                sys.exit(1)
+            except (socket.gaierror, OSError) as e: # Ошибки сети/DNS
+                logger.error(f"Ошибка сети или DNS при подключении к PostgreSQL: {e}. Проверьте хост/порт в DATABASE_URL.")
+                sys.exit(1)
+            except asyncpg.exceptions.InvalidPasswordError:
+                 logger.error("Ошибка аутентификации PostgreSQL: неверный пароль.")
+                 sys.exit(1)
+            except asyncpg.exceptions.InvalidCatalogNameError as e: # Добавляем обработку InvalidCatalogNameError
+                 logger.error(f"Ошибка PostgreSQL: база данных, указанная в URL, не найдена. {e}")
+                 sys.exit(1)
+            except asyncpg.PostgresError as e:
+                logger.error(f"Общая ошибка PostgreSQL при подключении/инициализации: {e}")
+                sys.exit(1)
+
+        # Сохраняем зависимости (путь к SQLite или пул PG) в workflow_data
+        dp.workflow_data['db'] = db_connection
+        dp.workflow_data['settings'] = settings
+        logger.info("Зависимости DB и Settings успешно сохранены в dispatcher")
+
+        # Регистрация обработчиков (декораторы уже сделали это)
+        logger.info("Обработчики команд и сообщений зарегистрированы")
+
+        # Регистрация обработчика shutdown БЕЗ передачи аргументов
+        dp.shutdown.register(on_shutdown)
+        logger.info("Обработчик shutdown зарегистрирован")
+
+        # Установка команд бота - помещаем здесь, в конце блока try
+        await set_bot_commands(bot)
+
+    except Exception as e:
+        logger.exception(f"Критическая ошибка при инициализации бота: {e}")
+        sys.exit(1)
+
+    # Запускаем бота
+    logger.info("Запуск бота (polling)...")
+    try:
+        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    except Exception as e:
+        logger.exception(f"Критическая ошибка во время работы бота: {e}")
+    finally:
+        # Закрытие сессии бота (важно для корректного завершения)
+        await bot.session.close()
+        logger.info("Сессия бота закрыта.")
+
+# Отдельная асинхронная функция для очистки задач
+async def cleanup_tasks():
+    tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+    if tasks:
+        logger.info(f"Ожидание завершения {len(tasks)} фоновых задач...")
+        [task.cancel() for task in tasks]
+        try:
+            await asyncio.gather(*tasks, return_exceptions=True)
+            logger.info("Фоновые задачи завершены.")
+        except asyncio.CancelledError:
+             logger.info("Задачи были отменены во время завершения.")
+
+# --- Функция для обновления прав администратора пользователя ---
+async def update_user_admin(db, target_user_id: int, make_admin: bool):
+    """Обновляет флаг is_admin для пользователя target_user_id"""
+    if settings.USE_SQLITE:
+        def _upd():
+            conn = sqlite3.connect(db)
+            cur = conn.cursor()
+            cur.execute(
+                "UPDATE users SET is_admin = ? WHERE user_id = ?",
+                (1 if make_admin else 0, target_user_id)
+            )
+            conn.commit()
+            conn.close()
+        await asyncio.to_thread(_upd)
+    else:
+        async with db.acquire() as conn:
+            await conn.execute(
+                "UPDATE users SET is_admin = $1 WHERE user_id = $2",
+                make_admin, target_user_id
+            )
+
+# Запускаем бота
 if __name__ == "__main__":
     try:
         asyncio.run(main())
-    except KeyboardInterrupt:
-         logger.info("Получен сигнал KeyboardInterrupt, завершаю работу...")
-    except SystemExit:
-         logger.info("Получен сигнал SystemExit, завершаю работу...")
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Бот остановлен по команде пользователя.")
+    except Exception as e:
+        logger.critical(f"Критическая ошибка: {e}")
+        traceback.print_exc()
     finally:
-        # Вызываем асинхронную очистку через asyncio.run
-        logger.info("Запуск очистки фоновых задач...")
         try:
+            logger.info("Запуск очистки оставшихся задач...")
             asyncio.run(cleanup_tasks())
-        except RuntimeError as e:
-            # Избегаем ошибки "Cannot run the event loop while another loop is running"
-            # если loop уже остановлен или используется в другом месте
-            if "Cannot run the event loop" in str(e):
-                 logger.warning("Не удалось запустить cleanup_tasks: цикл событий уже остановлен или занят.")
-            else:
-                 logger.exception("Ошибка во время выполнения cleanup_tasks.")
-        except Exception as e:
-            logger.exception("Непредвиденная ошибка во время выполнения cleanup_tasks.")
-
-        logger.info("Процесс завершен.")
+            logger.info("Очистка завершена.")
+        except Exception as cleanup_err:
+            logger.error(f"Ошибка при очистке задач: {cleanup_err}")
