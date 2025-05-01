@@ -143,7 +143,8 @@ bot = Bot(token=settings.TELEGRAM_BOT_TOKEN, default=DefaultBotProperties(parse_
 
 # --- Глобальные переменные для отслеживания прогресса и отмены ---
 progress_message_ids: dict[int, int] = {} # {user_id: message_id}
-active_requests: dict[int, asyncio.Task] = {} # {user_id: task}
+active_requests: dict[int, asyncio.Task] = {}  # {user_id: task}
+pending_photo_prompts: set[int] = set()  # Состояние ожидания запроса для генерации фото
 
 # --- Фильтр для проверки администратора ---
 class IsAdmin(BaseFilter):
@@ -180,10 +181,12 @@ def main_menu_keyboard() -> types.ReplyKeyboardMarkup:
     button3 = types.KeyboardButton(text="📊 Мои лимиты")
     button4 = types.KeyboardButton(text="💎 Подписка")
     button5 = types.KeyboardButton(text="🆘 Помощь")
+    button6 = types.KeyboardButton(text="📸 Генерация фото")
     keyboard = [
         [button1],
         [button2, button3],
-        [button4, button5]
+        [button4, button5],
+        [button6]
     ]
     return types.ReplyKeyboardMarkup(
         keyboard=keyboard,
@@ -869,9 +872,24 @@ async def start_handler(message: types.Message):
     & ~(F.text == "💎 Подписка")
     & ~(F.text == "🆘 Помощь")
     & ~(F.text == "❓ Задать вопрос")
+    & ~(F.text == "📸 Генерация фото")
 )
 async def message_handler(message: types.Message):
     user_id = message.from_user.id
+    if user_id in pending_photo_prompts:
+        pending_photo_prompts.remove(user_id)
+        prompt = message.text
+        try:
+            response = await vision_async_client.images.generate(
+                model="grok-2-image-1212",
+                prompt=prompt
+            )
+            url = response.data[0].url
+            await message.reply_photo(photo=url, reply_markup=main_menu_keyboard())
+        except Exception as e:
+            logger.exception(f"Ошибка генерации фото: {e}")
+            await message.reply("Произошла ошибка при генерации фото", reply_markup=main_menu_keyboard())
+        return
     chat_id = message.chat.id
     user_text = message.text
 
@@ -1459,6 +1477,12 @@ async def handle_help_button(message: types.Message):
 @dp.message(F.text == "❓ Задать вопрос")
 async def handle_ask_question_button(message: types.Message):
     await message.reply("Просто напишите ваш вопрос в чат 👇", reply_markup=main_menu_keyboard())
+
+@dp.message(F.text == "📸 Генерация фото")
+async def handle_generate_photo_button(message: types.Message):
+    user_id = message.from_user.id
+    pending_photo_prompts.add(user_id)
+    await message.reply("Напишите запрос для генерации фото (опишите, что хотите увидеть)", reply_markup=main_menu_keyboard())
 
 # --- Функции запуска и остановки ---
 
@@ -2314,6 +2338,12 @@ async def handle_help_button(message: types.Message):
 @dp.message(F.text == "❓ Задать вопрос")
 async def handle_ask_question_button(message: types.Message):
     await message.reply("Просто напишите ваш вопрос в чат 👇", reply_markup=main_menu_keyboard())
+
+@dp.message(F.text == "📸 Генерация фото")
+async def handle_generate_photo_button(message: types.Message):
+    user_id = message.from_user.id
+    pending_photo_prompts.add(user_id)
+    await message.reply("Напишите запрос для генерации фото (опишите, что хотите увидеть)", reply_markup=main_menu_keyboard())
 
 # --- Функции запуска и остановки ---
 
