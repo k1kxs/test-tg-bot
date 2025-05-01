@@ -1748,28 +1748,22 @@ async def admin_stats_enhanced(message: types.Message):
         logger.exception("Ошибка получения расширенной статистики")
         await message.reply(f"Ошибка получения статистики: {e}")
 
-@dp.message(Command("grant_admin"))
+@dp.message(Command("grant_admin"), IsAdmin())
 async def grant_admin_handler(message: types.Message):
     db = dp.workflow_data.get('db')
-    settings_local = dp.workflow_data.get('settings')
-    sender = message.from_user.id
-    sender_data = await get_user(db, sender)
-    if not sender_data or not sender_data.get('is_admin', False):
-        return await message.reply("🚫 У вас нет прав для выполнения этой команды.")
-
-    args = message.text.strip().split(maxsplit=1)
-    if len(args) < 2:
+    # Разбор аргументов
+    parts = message.text.strip().split(maxsplit=1)
+    if len(parts) != 2:
         return await message.reply("Использование: /grant_admin <user_id>")
     try:
-        target_id = int(args[1])
+        target_id = int(parts[1])
     except ValueError:
         return await message.reply("Неверный формат ID пользователя.")
-
-    target_data = await get_user(db, target_id)
-    if not target_data:
-        return await message.reply(f"Пользователь с ID {target_id} не найден.")
-
-    # Присваиваем права администратора
+    # Проверка существования пользователя
+    target = await get_user(db, target_id)
+    if not target:
+        return await message.reply(f"Пользователь {target_id} не найден.")
+    # Обновляем права администратора
     await update_user_admin(db, target_id, True)
     await message.reply(f"✅ Пользователь {target_id} теперь администратор.")
 
