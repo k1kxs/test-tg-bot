@@ -139,11 +139,10 @@ def progress_keyboard(user_id: int) -> types.InlineKeyboardMarkup:
     builder.button(text="❌ Отмена", callback_data=f"cancel_generation_{user_id}")
     return builder.as_markup()
 
-def final_keyboard() -> types.InlineKeyboardMarkup:
-    """Создает финальную клавиатуру (например, с кнопкой очистки истории)."""
+def final_keyboard(user_id: int) -> types.InlineKeyboardMarkup:
+    """Создает клавиатуру с кнопкой 'Отмена' для прекращения генерации."""
     builder = InlineKeyboardBuilder()
-    builder.button(text="🔄 Очистить историю", callback_data="clear_history")
-    # Можно добавить другие кнопки по желанию
+    builder.button(text="❌ Отмена", callback_data=f"cancel_generation_{user_id}")
     return builder.as_markup()
 
 # Добавляю клавиатуру главного меню для часто используемых действий
@@ -499,7 +498,7 @@ async def stream_xai_response(api_key: str, system_prompt: str, history: list[di
         "model": "grok-3-mini-beta",
         "messages": messages,
         "stream": True,
-        "temperature": 0.7,
+        "temperature": 0.4,
         "reasoning": {"effort": "high"},
     }
     # Таймаут для запроса (в секундах)
@@ -774,6 +773,8 @@ async def message_handler(message: types.Message):
             logger.warning(f"Не удалось отправить сообщение о дублирующем запросе: {e}")
         return
 
+    # Регистрируем текущую задачу генерации, чтобы ее можно было отменить
+    active_requests[user_id] = asyncio.current_task()
     # Показываем индикатор "печатает"
     await bot.send_chat_action(chat_id=chat_id, action="typing")
 
@@ -798,7 +799,7 @@ async def message_handler(message: types.Message):
 
         # Отправка самого первого плейсхолдера
         try:
-            placeholder_message = await message.answer("⏳") # Короткий плейсхолдер
+            placeholder_message = await message.answer("⏳", reply_markup=progress_keyboard(user_id))  # Короткий плейсхолдер с кнопкой Отмена
             current_message_id = placeholder_message.message_id
             message_count = 1
             last_edit_time = time.monotonic()
@@ -837,7 +838,7 @@ async def message_handler(message: types.Message):
                             chat_id=chat_id,
                             message_id=current_message_id,
                             parse_mode=None if formatting_failed else ParseMode.HTML,
-                            reply_markup=None # Без клавиатуры у промежуточных
+                            reply_markup=progress_keyboard(user_id)  # Сохраняем кнопку Отмена
                         )
                 except TelegramAPIError as e:
                     logger.error(f"Ошибка финализации сообщения {message_count}: {e}")
@@ -854,18 +855,21 @@ async def message_handler(message: types.Message):
                         logger.error(f"Ошибка raw финализации сообщения {message_count}. Сообщение потеряно.")
                         current_message_id = None
 
-                # Начинаем новое сообщение
-                current_message_text = chunk # Начинаем с нового чанка
+                # Начинаем новое сообщение при переполнении: убираем отмену из старого и отправляем новый placeholder
+                current_message_text = chunk  # Начинаем с нового чанка
                 message_count += 1
                 try:
-                    placeholder_message = await message.answer("...") # Плейсхолдер для новой части
+                    # удаляем кнопку 'Отмена' из предыдущего сообщения
+                    await bot.edit_message_reply_markup(chat_id=chat_id, message_id=current_message_id, reply_markup=None)
+                    # отправляем новый placeholder с кнопкой 'Отмена'
+                    placeholder_message = await message.answer("...", reply_markup=progress_keyboard(user_id))
                     current_message_id = placeholder_message.message_id
                     last_edit_time = time.monotonic()
                     logger.info(f"Начато новое сообщение {message_count} (ID: {current_message_id})")
                 except TelegramAPIError as e:
                     logger.error(f"Ошибка отправки плейсхолдера для сообщения {message_count}: {e}")
                     current_message_id = None
-                    break # Прерываем стрим, если не можем создать новое сообщение
+                    break  # Прерываем стрим, если не можем создать новое сообщение
 
             else:
                 # Лимит не превышен, добавляем чанк к текущему тексту
@@ -881,7 +885,8 @@ async def message_handler(message: types.Message):
                             text=text_to_show,
                             chat_id=chat_id,
                             message_id=current_message_id,
-                            parse_mode=None if formatting_failed else ParseMode.HTML
+                            parse_mode=None if formatting_failed else ParseMode.HTML,
+                            reply_markup=progress_keyboard(user_id)  # Обновляем кнопку Отмена
                         )
                         last_edit_time = now
                     except TelegramRetryAfter as e:
@@ -908,14 +913,18 @@ async def message_handler(message: types.Message):
             logger.info(f"Финализация последнего сообщения {message_count} (ID: {current_message_id})")
             try:
                 final_html = markdown_to_telegram_html(current_message_text) if not formatting_failed else current_message_text
-                final_keyboard_markup = final_keyboard() # Клавиатура только у последнего
-
+                # оформляем финальный текст без кнопок в этом сообщении
                 await bot.edit_message_text(
                     text=final_html,
                     chat_id=chat_id,
                     message_id=current_message_id,
                     parse_mode=None if formatting_failed else ParseMode.HTML,
-                    reply_markup=final_keyboard_markup
+                    reply_markup=None
+                )
+                # затем показываем ReplyKeyboardMarkup меню новым сообщением
+                await message.answer(
+                    "Выберите действие или введите вопрос...",
+                    reply_markup=main_menu_keyboard()
                 )
                 logger.info(f"Последнее сообщение {message_count} {'RAW' if formatting_failed else 'HTML'} отправлено.")
 
@@ -923,12 +932,13 @@ async def message_handler(message: types.Message):
                 logger.error(f"Ошибка финализации последнего сообщения {message_count}: {e}")
                 # Попытка отправить raw как fallback
                 try:
+                    # Raw fallback: редактируем без кнопок
                     await bot.edit_message_text(
-                        text=current_message_text, # Raw
+                        text=current_message_text,
                         chat_id=chat_id,
                         message_id=current_message_id,
                         parse_mode=None,
-                        reply_markup=final_keyboard_markup
+                        reply_markup=None
                     )
                     logger.info(f"Последнее сообщение {message_count} RAW отправлено после ошибки HTML.")
                 except TelegramAPIError as plain_e:
@@ -938,7 +948,7 @@ async def message_handler(message: types.Message):
                          await message.answer(
                              text=current_message_text,
                              parse_mode=None,
-                             reply_markup=final_keyboard_markup
+                             reply_markup=main_menu_keyboard()
                          )
                          logger.info(f"Последняя часть {message_count} отправлена новым сообщением после ошибки редактирования.")
                     except Exception as final_send_err:
@@ -948,7 +958,17 @@ async def message_handler(message: types.Message):
             # Если API ничего не вернуло после первого плейсхолдера
             logger.warning(f"Не получен ответ от XAI для пользователя {user_id}")
             try:
-                await bot.edit_message_text("К сожалению, не удалось получить ответ от AI.", chat_id=chat_id, message_id=current_message_id, reply_markup=None)
+                # Показ ошибки без кнопок, затем меню
+                await bot.edit_message_text(
+                    "К сожалению, не удалось получить ответ от AI.",
+                    chat_id=chat_id,
+                    message_id=current_message_id,
+                    reply_markup=None
+                )
+                await message.answer(
+                    "Выберите действие или введите вопрос...",
+                    reply_markup=main_menu_keyboard()
+                )
             except TelegramAPIError:
                 pass # Игнорируем, если сообщение уже удалено
 
@@ -963,6 +983,8 @@ async def message_handler(message: types.Message):
 
     except Exception as e:
         logger.exception(f"Критическая ошибка в обработчике сообщений для user_id={user_id}: {e}")
+        # очистка active_requests при ошибке
+        active_requests.pop(user_id, None)
         try:
             # Пытаемся отредактировать последнее известное сообщение об ошибке
             error_message = "Произошла серьезная ошибка при обработке вашего запроса."
@@ -976,44 +998,33 @@ async def message_handler(message: types.Message):
 # --- Обработчик отмены генерации ---
 @dp.callback_query(F.data.startswith("cancel_generation_"))
 async def cancel_generation_callback(callback: types.CallbackQuery):
+    """Обрабатывает отмену генерации: прекращает задачу, убирает клавиатуру и показывает меню."""
+    # Парсим user_id из callback_data
     try:
-        user_id_to_cancel = int(callback.data.split("_")[-1])
-        requesting_user_id = callback.from_user.id
-
-        # Проверяем, что пользователь отменяет свой собственный запрос
-        if user_id_to_cancel != requesting_user_id:
-            await callback.answer("Вы не можете отменить чужой запрос.", show_alert=True)
-            return
-
-        task_to_cancel = active_requests.get(user_id_to_cancel)
-
-        if task_to_cancel:
-            task_to_cancel.cancel()
-            logger.info(f"Запрос на генерацию для пользователя {user_id_to_cancel} отменен пользователем.")
-            await callback.answer("Генерация ответа отменена.")
-            # Сообщение с прогрессом будет удалено в блоке finally/except CancelledError обработчика
-            # но можно и здесь попробовать удалить кнопку или отредактировать сообщение
-            try:
-                await callback.message.edit_text("Генерация ответа отменена.", reply_markup=None)
-            except TelegramAPIError as e:
-                 logger.warning(f"Не удалось отредактировать сообщение после отмены: {e}")
-
-        else:
-            logger.warning(f"Не найден активный запрос для отмены для пользователя {user_id_to_cancel}")
-            await callback.answer("Не найден активный запрос для отмены.", show_alert=True)
-            # Убираем клавиатуру, если запроса уже нет
-            try:
-                await callback.message.edit_reply_markup(reply_markup=None)
-            except TelegramAPIError:
-                pass # Игнорируем ошибку, если не можем изменить
-
+        user_id_to_cancel = int(callback.data.rsplit("_", 1)[-1])
     except ValueError:
-        logger.error(f"Ошибка парсинга user_id из callback_data: {callback.data}")
-        await callback.answer("Ошибка обработки запроса.", show_alert=True)
-    except Exception as e:
-        logger.exception(f"Ошибка в cancel_generation_callback: {e}")
-        await callback.answer("Произошла ошибка при отмене.", show_alert=True)
+        await callback.answer("Ошибка обработки отмены.", show_alert=True)
+        return
 
+    # Отменяем задачу генерации, если она есть
+    task = active_requests.pop(user_id_to_cancel, None)
+    if task:
+        task.cancel()
+
+    # Убираем inline-клавиатуру отмены
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except TelegramAPIError:
+        pass
+
+    # Уведомляем пользователя о завершении отмены
+    await callback.answer("Генерация ответа отменена.", show_alert=False)
+
+    # Показываем главное меню
+    await callback.message.answer(
+        "Выберите действие или введите вопрос...",
+        reply_markup=main_menu_keyboard()
+    )
 
 @dp.callback_query(F.data == "clear_history")
 async def clear_history_callback(callback: types.CallbackQuery):
