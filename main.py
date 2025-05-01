@@ -21,6 +21,7 @@ import io
 import typing
 import time
 import html
+import datetime
 from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
@@ -144,6 +145,27 @@ def final_keyboard() -> types.InlineKeyboardMarkup:
     builder.button(text="🔄 Очистить историю", callback_data="clear_history")
     # Можно добавить другие кнопки по желанию
     return builder.as_markup()
+
+# Добавляю клавиатуру главного меню для часто используемых действий
+def main_menu_keyboard() -> types.ReplyKeyboardMarkup:
+    """
+    Создает и возвращает клавиатуру главного меню с кнопками под полем ввода.
+    """
+    button1 = types.KeyboardButton(text="❓ Задать вопрос")
+    button2 = types.KeyboardButton(text="🔄 Новый диалог")
+    button3 = types.KeyboardButton(text="📊 Мои лимиты")
+    button4 = types.KeyboardButton(text="💎 Подписка")
+    button5 = types.KeyboardButton(text="🆘 Помощь")
+    keyboard = [
+        [button1],
+        [button2, button3],
+        [button4, button5]
+    ]
+    return types.ReplyKeyboardMarkup(
+        keyboard=keyboard,
+        resize_keyboard=True,
+        input_field_placeholder="Выберите действие или введите вопрос..."
+    )
 
 # --- Функции для работы с базой данных (SQLite и PostgreSQL) ---
 # (Оставлены без изменений, так как они работали корректно)
@@ -354,6 +376,106 @@ async def get_last_messages_postgres(pool: asyncpg.Pool, user_id: int, limit: in
     except Exception as e:
         logger.exception(f"PostgreSQL: Непредвиденная ошибка при получении истории: {e}")
         return []
+
+# --- Функции для работы с таблицей users ---
+
+async def get_or_create_user(db, user_id: int, username: str | None, first_name: str, last_name: str | None):
+    """Получает пользователя из БД или создает нового, если не найден."""
+    user_data = await get_user(db, user_id)
+    if user_data:
+        # Опционально: обновить имя/username, если они изменились
+        # await update_user_info(db, user_id, username, first_name, last_name)
+        # Обновляем дату последней активности при каждом получении
+        await update_user_last_active(db, user_id)
+        return user_data
+
+    # Создаем нового пользователя
+    if settings.USE_SQLITE:
+        return await add_user_sqlite(db, user_id, username, first_name, last_name)
+    else:
+        return await add_user_postgres(db, user_id, username, first_name, last_name)
+
+async def get_user(db, user_id: int) -> dict | None:
+    """Получает данные пользователя по ID."""
+    if settings.USE_SQLITE:
+        def _get():
+            conn = sqlite3.connect(db)
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
+            row = cursor.fetchone()
+            conn.close()
+            return dict(row) if row else None
+        return await asyncio.to_thread(_get)
+    else: # PostgreSQL
+        async with db.acquire() as conn:
+            row = await conn.fetchrow("SELECT * FROM users WHERE user_id = $1", user_id)
+            return dict(row) if row else None
+
+async def add_user_sqlite(db_path: str, user_id: int, username: str | None, first_name: str, last_name: str | None):
+    """Добавляет нового пользователя в SQLite."""
+    try:
+        def _add():
+            conn = sqlite3.connect(db_path)
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO users (user_id, username, first_name, last_name, last_active_date, last_free_reset_date)
+                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, date('now'))
+                ON CONFLICT(user_id) DO NOTHING -- Игнорировать, если пользователь уже есть
+                """,
+                (user_id, username, first_name, last_name)
+            )
+            conn.commit()
+            conn.close()
+            logger.info(f"SQLite: Добавлен новый пользователь {user_id}")
+        await asyncio.to_thread(_add)
+        return await get_user(db_path, user_id) # Возвращаем созданного пользователя
+    except Exception as e:
+        logger.exception(f"SQLite: Ошибка добавления пользователя {user_id}: {e}")
+        return None
+
+async def add_user_postgres(pool: asyncpg.Pool, user_id: int, username: str | None, first_name: str, last_name: str | None):
+    """Добавляет нового пользователя в PostgreSQL."""
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO users (user_id, username, first_name, last_name, last_active_date, last_free_reset_date)
+                VALUES ($1, $2, $3, $4, NOW(), CURRENT_DATE)
+                ON CONFLICT (user_id) DO NOTHING -- Игнорировать, если пользователь уже есть
+                """,
+                user_id, username, first_name, last_name
+            )
+        logger.info(f"PostgreSQL: Добавлен новый пользователь {user_id}")
+        return await get_user(pool, user_id) # Возвращаем созданного пользователя
+    except asyncpg.PostgresError as e:
+        logger.error(f"PostgreSQL: Ошибка добавления пользователя {user_id}: {e}")
+        return None
+
+async def update_user_last_active(db, user_id: int):
+    """Обновляет время последней активности пользователя."""
+    try:
+        if settings.USE_SQLITE:
+            def _update():
+                conn = sqlite3.connect(db)
+                cursor = conn.cursor()
+                cursor.execute("UPDATE users SET last_active_date = CURRENT_TIMESTAMP WHERE user_id = ?", (user_id,))
+                conn.commit()
+                conn.close()
+            await asyncio.to_thread(_update)
+        else: # PostgreSQL
+            async with db.acquire() as conn:
+                await conn.execute("UPDATE users SET last_active_date = NOW() WHERE user_id = $1", user_id)
+        # logger.debug(f"Обновлена last_active_date для user_id={user_id}") # Опционально для отладки
+    except Exception as e:
+        logger.exception(f"Ошибка обновления last_active_date для user_id={user_id}: {e}")
+
+
+# --- Добавьте другие функции обновления по мере необходимости ---
+# Например, для обновления лимитов, статуса подписки и т.д.
+# async def update_user_limits(...)
+# async def update_user_subscription(...)
 
 # --- Взаимодействие с XAI API ---
 
@@ -573,24 +695,51 @@ def split_text(text: str, length: int = TELEGRAM_MAX_LENGTH) -> list[str]:
 
 @dp.message(Command("start"))
 async def start_handler(message: types.Message):
-    builder = InlineKeyboardBuilder()
-    # Используем final_keyboard для консистентности
-    builder.button(text="🔄 Очистить историю", callback_data="clear_history")
-    await message.answer("Привет! Я ваш AI ассистент. Задайте ваш вопрос.", reply_markup=builder.as_markup())
+    user_id = message.from_user.id # Получаем user_id
+    # Получаем зависимости
+    db = dp.workflow_data.get('db')
+    current_settings = dp.workflow_data.get('settings')
 
-@dp.message(F.text)
+    if not db or not current_settings:
+        logger.error(f"Не удалось получить БД/настройки в start_handler для user_id={user_id}")
+        await message.answer("Произошла внутренняя ошибка (код s1), попробуйте позже.")
+        return
+
+    # --- Получаем или создаем пользователя ---
+    user_data = await get_or_create_user(
+        db,
+        user_id,
+        message.from_user.username,
+        message.from_user.first_name,
+        message.from_user.last_name
+    )
+    if not user_data:
+        logger.error(f"Не удалось получить или создать пользователя {user_id} в start_handler")
+        await message.answer("Произошла внутренняя ошибка (код s2), попробуйте позже.")
+        return
+    logger.debug(f"Данные пользователя {user_id} (start): {user_data}")
+    # --- Конец изменений ---
+
+    # Отправляем главное меню с кнопками ReplyKeyboardMarkup
+    keyboard = main_menu_keyboard()
+    await message.answer(
+        f"Привет, {message.from_user.first_name}! Я ваш AI ассистент.\n"
+        "Задайте ваш вопрос или используйте кнопки меню.",
+        reply_markup=keyboard
+    )
+
+@dp.message(
+    F.text
+    & ~(F.text == "🔄 Новый диалог")
+    & ~(F.text == "📊 Мои лимиты")
+    & ~(F.text == "💎 Подписка")
+    & ~(F.text == "🆘 Помощь")
+    & ~(F.text == "❓ Задать вопрос")
+)
 async def message_handler(message: types.Message):
     user_id = message.from_user.id
     chat_id = message.chat.id
     user_text = message.text
-
-    # Проверка, не идет ли уже генерация для этого пользователя
-    if user_id in active_requests:
-        try:
-            await message.reply("Пожалуйста, дождитесь завершения предыдущего запроса или отмените его.", reply_markup=progress_keyboard(user_id))
-        except TelegramAPIError as e:
-            logger.warning(f"Не удалось отправить сообщение о дублирующем запросе: {e}")
-        return
 
     # Получаем зависимости из workflow_data
     db = dp.workflow_data.get('db')
@@ -599,6 +748,30 @@ async def message_handler(message: types.Message):
     if not db or not current_settings:
         logger.error("Не удалось получить соединение с БД или настройки")
         await message.answer("Произошла внутренняя ошибка (код 1), попробуйте позже.")
+        return
+
+    # --- Получаем или создаем пользователя (обновляем last_active) ---
+    user_data = await get_or_create_user(
+        db,
+        user_id,
+        message.from_user.username,
+        message.from_user.first_name,
+        message.from_user.last_name
+    )
+    if not user_data:
+        logger.error(f"Не удалось получить или создать пользователя {user_id}")
+        await message.answer("Произошла внутренняя ошибка (код 3), попробуйте позже.")
+        return
+    # Теперь у вас есть user_data - словарь с данными пользователя
+    logger.debug(f"Данные пользователя {user_id}: {user_data}")
+    # --- КОНЕЦ ИЗМЕНЕНИЙ ---
+
+    # Проверка, не идет ли уже генерация для этого пользователя
+    if user_id in active_requests:
+        try:
+            await message.reply("Пожалуйста, дождитесь завершения предыдущего запроса или отмените его.", reply_markup=progress_keyboard(user_id))
+        except TelegramAPIError as e:
+            logger.warning(f"Не удалось отправить сообщение о дублирующем запросе: {e}")
         return
 
     # Показываем индикатор "печатает"
@@ -854,6 +1027,21 @@ async def clear_history_callback(callback: types.CallbackQuery):
         await callback.answer("Ошибка при очистке истории", show_alert=True)
         return
 
+    # --- Получаем или создаем пользователя (обновляем last_active) ---
+    user_data = await get_or_create_user(
+        db,
+        user_id,
+        callback.from_user.username,
+        callback.from_user.first_name,
+        callback.from_user.last_name
+    )
+    if not user_data:
+        logger.error(f"Не удалось получить или создать пользователя {user_id} в clear_history_callback")
+        await callback.answer("Произошла внутренняя ошибка (код ch1), попробуйте позже.", show_alert=True)
+        return
+    logger.debug(f"Данные пользователя {user_id} (clear_history_callback): {user_data}")
+    # --- Конец изменений ---
+
     try:
         rows_deleted_count = 0
         if current_settings.USE_SQLITE:
@@ -905,6 +1093,21 @@ async def clear_command_handler(message: types.Message):
         logger.error("Не удалось получить БД/настройки при очистке истории (/clear)")
         await message.answer("Произошла внутренняя ошибка (код 2), попробуйте позже.")
         return
+
+    # --- Получаем или создаем пользователя (обновляем last_active) ---
+    user_data = await get_or_create_user(
+        db,
+        user_id,
+        message.from_user.username,
+        message.from_user.first_name,
+        message.from_user.last_name
+    )
+    if not user_data:
+        logger.error(f"Не удалось получить или создать пользователя {user_id} в clear_command_handler")
+        await message.answer("Произошла внутренняя ошибка (код cl1), попробуйте позже.")
+        return
+    logger.debug(f"Данные пользователя {user_id} (clear_command): {user_data}")
+    # --- Конец изменений ---
 
     try:
         rows_deleted_count = 0
@@ -967,6 +1170,58 @@ async def document_handler(message: types.Message):
     logger.info(f"Получен документ от user_id={user_id}: {file_name} (type: {mime_type})")
     await message.reply(f"Получил документ '{file_name}'. Обработка документов пока не реализована.")
 
+# --- Обработчики для кнопок меню ReplyKeyboardMarkup
+@dp.message(F.text == "🔄 Новый диалог")
+async def handle_new_dialog_button(message: types.Message):
+    # Просто вызываем существующий обработчик команды /clear
+    await clear_command_handler(message)
+
+@dp.message(F.text == "📊 Мои лимиты")
+async def handle_my_limits_button(message: types.Message):
+    user_id = message.from_user.id
+    db = dp.workflow_data.get('db')
+    if not db:
+        await message.reply("Ошибка получения данных.")
+        return
+    user_data = await get_user(db, user_id)
+    if not user_data:
+        await message.reply("Не удалось найти ваши данные.")
+        return
+    limit_info = f"Осталось бесплатных сообщений сегодня: {user_data.get('free_messages_today', 'N/A')}"
+    sub_info = "Подписка: неактивна"
+    if user_data.get('subscription_status') == 'active':
+        expires_ts = user_data.get('subscription_expires')
+        if isinstance(expires_ts, datetime.datetime):
+            expires_str = expires_ts.strftime('%Y-%m-%d %H:%M')
+            sub_info = f"Подписка активна до: {expires_str}"
+        else:
+            sub_info = f"Подписка активна до: {expires_ts}"
+    await message.reply(f"Информация о ваших лимитах:\n\n{limit_info}\n{sub_info}")
+
+@dp.message(F.text == "💎 Подписка")
+async def handle_subscription_button(message: types.Message):
+    # Заглушка раздела подписки
+    await message.reply(
+        "Раздел 'Подписка'.\n\n"
+        "Доступные тарифы:\n- 7 дней / 100 руб.\n- 30 дней / 300 руб.\n\n"
+        "(Функционал оплаты будет добавлен позже)"
+    )
+
+@dp.message(F.text == "🆘 Помощь")
+async def handle_help_button(message: types.Message):
+    help_text = (
+        "<b>Помощь по боту:</b>\n\n"
+        "🤖 Я - ваш AI ассистент, работающий на модели Grok.\n"
+        "❓ Просто напишите ваш вопрос, и я постараюсь ответить.\n"
+        "🔄 Используйте кнопку \"Новый диалог\" или команду /clear, чтобы очистить историю и начать разговор с чистого листа.\n"
+        "📊 Кнопка \"Мои лимиты\" покажет, сколько бесплатных сообщений у вас осталось сегодня или до какого числа действует подписка.\n"
+        "💎 Кнопка \"Подписка\" расскажет о платных тарифах для снятия лимитов."
+    )
+    await message.reply(help_text, reply_markup=main_menu_keyboard())
+
+@dp.message(F.text == "❓ Задать вопрос")
+async def handle_ask_question_button(message: types.Message):
+    await message.reply("Просто напишите ваш вопрос в чат 👇", reply_markup=main_menu_keyboard())
 
 # --- Функции запуска и остановки ---
 
